@@ -131,7 +131,7 @@ async def set_state(
     )
 
 
-async def clear_state(telegram_id: int) -> None:
+async def clear_state(telegram_id int) -> None:
     """Clear current setup state."""
     await set_state(telegram_id, None, {})
 
@@ -256,7 +256,7 @@ async def receive_cookie(
             chat_id,
             "\u26a1 Fingerprint/CAPTCHA Shopee terdeteksi!\n\n"
             "Untuk melanjutkan, kirim risktoken kamu.\n"
-            "Format: dGAOpcjLx9vrTGoRYEbfew==|...|08|1\n\n"
+            "Format: dGAOphjLx9vrTGoRYEbfew==|...|08|1\n\n"
             "Cara dapat risktoken:\n"
             "- Buka shopee.co.id di browser\n"
             "- Login atau refresh halaman\n"
@@ -283,6 +283,7 @@ async def receive_cookie(
         {
             "$set": {
                 "cookie_enc": encrypt(cookie),
+                "risktoken_enc": None,
                 "cookie_verified_at": now,
                 "account_username": result.account_username,
                 "account_has_phone": result.has_phone,
@@ -345,6 +346,7 @@ async def receive_fingerprint(
         {"telegram_id": user_id},
         {"$set": {
             "cookie_enc": pending_cookie_enc,
+            "risktoken_enc": encrypt(risktoken.strip()),
             "cookie_verified_at": now,
             "account_username": result.account_username,
             "account_has_phone": result.has_phone,
@@ -575,7 +577,7 @@ async def command_start_monitor(
     )
 
     if await start_worker(user_id):
-        await send_message(chat_id, f"\u25b6\ufe0f Monitoring dimulai{username_info}.")
+        await send_message(chat_id, f"\u25b6\ufe0f Monitoring dimulai(username_info}.")
     else:
         await send_message(chat_id, "\u2139\ufe0f Monitoring sudah berjalan.")
 
@@ -627,7 +629,7 @@ async def command_status(
     status_text = "Aktif" if active else "Tidak aktif"
     text = (
         f"{status_icon} <b>Status:</b> "
-        f"{status_text}\n\n"
+        f"status_text}\n\n"
         f"<b>Akun:</b> {account}\n"
         f"<b>Phone:</b> {phone_status}\n"
         f"<b>Cookie:</b> {cookie_status}\n"
