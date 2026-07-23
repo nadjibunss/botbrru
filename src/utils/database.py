@@ -1,4 +1,4 @@
-MongoDB connection lifecycle.
+"""MongoDB connection lifecycle."""
 from __future__ import annotations
 
 import logging
@@ -14,7 +14,7 @@ _database: AsyncIOMotorDatabase | None = None
 
 
 async def get_db() -> AsyncIOMotorDatabase:
-    Return initialized MongoDB database connection.
+    """Return initialized MongoDB database connection."""
     global _client, _database
 
     if _client is None:
@@ -36,7 +36,7 @@ async def get_db() -> AsyncIOMotorDatabase:
 
 
 async def is_db_available() -> bool:
-    Return whether MongoDB can be reached.
+    """Return whether MongoDB can be reached."""
     try:
         await get_db()
         return True
@@ -46,7 +46,7 @@ async def is_db_available() -> bool:
 
 
 async def close_db() -> None:
-    Close global MongoDB client.
+    """Close global MongoDB client."""
     global _client, _database
 
     if _client is not None:
