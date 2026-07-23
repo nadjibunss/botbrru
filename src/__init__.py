@@ -1,0 +1,1 @@
+Shopee monitor bot package.
