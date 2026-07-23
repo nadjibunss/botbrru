@@ -1,4 +1,4 @@
-FastAPI entry point and Telegram long-polling lifecycle.
+"""FastAPI entry point and Telegram long-polling lifecycle."""
 from __future__ import annotations
 
 import asyncio
@@ -23,7 +23,7 @@ _polling_task: asyncio.Task | None = None
 
 
 async def polling_loop() -> None:
-    Receive Telegram updates indefinitely.
+    """Receive Telegram updates indefinitely."""
     logger.info("Telegram polling started")
 
     await delete_webhook()
@@ -55,7 +55,7 @@ async def polling_loop() -> None:
 
 
 async def restore_workers() -> None:
-    Restart workers for users with monitoring_active=True.
+    """Restart workers for users with monitoring_active=True."""
     db = await get_db()
     cursor = db.users.find({"monitoring_active": True, "cookie_enc": {"$ne": None}})
 
@@ -67,7 +67,7 @@ async def restore_workers() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    Manage database and polling task.
+    """Manage database and polling task."""
     global _polling_task
 
     await get_db()
@@ -96,5 +96,5 @@ app = FastAPI(
 
 @app.get("/health")
 async def health() -> dict:
-    Container health endpoint.
+    """Container health endpoint."""
     return {"status": "ok", "mode": "polling"}
