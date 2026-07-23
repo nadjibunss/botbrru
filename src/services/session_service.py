@@ -27,6 +27,13 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _safe_str(s: str | None) -> str | None:
+    """Strip surrogate characters that cannot be UTF-8 encoded."""
+    if s is None:
+        return None
+    return s.encode("utf-8", errors="ignore").decode("utf-8")
+
+
 def is_cookie_shape_valid(cookie: str) -> bool:
     """Perform minimal local cookie-shape validation."""
     return bool(cookie and "=" in cookie and len(cookie) >= 10)
@@ -114,7 +121,7 @@ async def validate_cookie(cookie: str, risktoken: str | None = None) -> SessionV
         user_profile = data.get("user_profile", {}) if isinstance(data, dict) else {}
 
         if user_profile:
-            username = (
+            username = _safe_str(
                 user_profile.get("username")
                 or user_profile.get("nickname")
             )
