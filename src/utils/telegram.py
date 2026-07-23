@@ -16,6 +16,24 @@ def _url(token: str, method: str) -> str:
     return f"{BASE_URL.format(token=token)}/{method}"
 
 
+def _safe_text(text: str) -> str:
+    # Fast path: already valid UTF-8
+    try:
+        text.encode("utf-8")
+        return text
+    except UnicodeEncodeError:
+        pass
+    # Try to recover surrogate pairs as real emoji via utf-16
+    try:
+        fixed = text.encode("utf-16", errors="surrogatepass").decode("utf-16")
+        fixed.encode("utf-8")
+        return fixed
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        pass
+    # Last resort: strip lone surrogates
+    return text.encode("utf-8", errors="ignore").decode("utf-8")
+
+
 async def _post(
     method: str,
     payload: dict,
@@ -54,32 +72,11 @@ async def _get(
         return {"ok": False}
 
 
-def _safe_text(text: str) -> str:
-    """Handle surrogate chars from external APIs (e.g. emoji in Shopee usernames).
-
-    Surrogate pairs like \uD83D\uDE00 are converted back to real emoji (e.g. 😀).
-    Only lone/unpaired surrogates that cannot be fixed are stripped as last resort.
-    """
-    try:
-        text.encode("utf-8")
-        return text  # already valid UTF-8, no changes needed
-    except UnicodeEncodeError:
-        # Try to preserve emoji: re-encode surrogate pairs via utf-16
-        try:
-            fixed = text.encode("utf-16", errors="surrogatepass").decode("utf-16")
-            fixed.encode("utf-8")  # verify now valid
-            return fixed
-        except (UnicodeEncodeError, UnicodeDecodeError):
-            # Last resort: strip unpaired lone surrogates only
-            return text.encode("utf-8", errors="ignore").decode("utf-8")
-
-
 async def send_message(
     chat_id: int | str,
     text: str,
     token: str | None = None,
 ) -> dict:
-    \"\"\"Send HTML-formatted Telegram message.\"\"\"
     return await _post(
         "sendMessage",
         {
@@ -90,3 +87,39 @@ async def send_message(
         },
         token,
     )
+
+
+async def delete_message(
+    chat_id: int | str,
+    message_id: int,
+    token: str | None = None,
+) -> bool:
+    result = await _post(
+        "deleteMessage",
+        {"chat_id": chat_id, "message_id": message_id},
+        token,
+    )
+    return bool(result.get("ok"))
+
+
+async def delete_webhook() -> dict:
+    return await _post(
+        "deleteWebhook",
+        {"drop_pending_updates": False},
+    )
+
+
+async def get_updates(offset: int, timeout: int = 30) -> list[dict]:
+    data = await _get(
+        "getUpdates",
+        {
+            "offset": offset,
+            "timeout": timeout,
+            "allowed_updates": ["message"],
+        },
+    )
+
+    if not data.get("ok"):
+        return []
+
+    return data.get("result", [])
