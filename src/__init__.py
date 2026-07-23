@@ -1,1 +1,1 @@
-Shopee monitor bot package.
+"""Shopee monitor bot package."""
