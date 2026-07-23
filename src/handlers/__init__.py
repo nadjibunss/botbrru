@@ -1,1 +1,1 @@
-Telegram handlers package.
+"""Telegram handlers package."""
