@@ -445,7 +445,7 @@ async def command_start_monitor(
     chat_id: int,
     user_id: int,
 ) -> None:
-    """Enable worker after cookie exists."""
+    """Enable worker after cookie exists and session is valid."""
     db = await get_db()
     user = await db.users.find_one({"telegram_id": user_id})
 
@@ -456,13 +456,35 @@ async def command_start_monitor(
         )
         return
 
+    # Validasi cookie ke Shopee sebelum mulai — pastikan sudah login
+    try:
+        cookie = decrypt(user["cookie_enc"])
+    except ValueError:
+        await send_message(
+            chat_id,
+            "❌ Cookie tidak dapat dibaca. Jalankan /setcredentials untuk kirim cookie baru.",
+        )
+        return
+
+    await send_message(chat_id, "🔍 Memeriksa sesi Shopee...")
+    session = await validate_cookie(cookie)
+
+    if not session.valid:
+        await send_message(
+            chat_id,
+            f"❌ Sesi Shopee tidak valid: {session.reason}\n\n"
+            "Jalankan /setcredentials untuk kirim cookie baru.",
+        )
+        return
+
+    username_info = f" (@{session.account_username})" if session.account_username else ""
     await db.users.update_one(
         {"telegram_id": user_id},
         {"$set": {"monitoring_active": True}},
     )
 
     if await start_worker(user_id):
-        await send_message(chat_id, "▶️ Monitoring dimulai.")
+        await send_message(chat_id, f"▶️ Monitoring dimulai{username_info}.")
     else:
         await send_message(chat_id, "ℹ️ Monitoring sudah berjalan.")
 
