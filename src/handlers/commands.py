@@ -434,33 +434,23 @@ async def command_set_fingerprint(
     user_id: int,
     args: str,
 ) -> None:
-    """Store optional non-secret fingerprint JSON."""
-    if not args:
+    """Store risktoken for Shopee requests (pipe-separated format)."""
+    risktoken = args.strip()
+    if not risktoken:
         await send_message(
             chat_id,
-            "\u274c Format: /setfingerprint &lt;JSON object&gt;",
+            "❌ Format: /setfingerprint &lt;risktoken&gt;\n\n"
+            "Contoh: /setfingerprint dGAOpcjLx9vrTGoRY...|08|1\n\n"
+            "Risktoken ini dipakai di semua request ke Shopee untuk bypass anti-bot.",
         )
         return
 
-    try:
-        fingerprint = json.loads(args)
-    except json.JSONDecodeError:
-        await send_message(chat_id, "\u274c Fingerprint harus JSON valid.")
-        return
-
-    if not isinstance(fingerprint, dict):
-        await send_message(chat_id, "\u274c Fingerprint harus JSON object.")
-        return
-
     db = await get_db()
-
     await db.users.update_one(
         {"telegram_id": user_id},
-        {"$set": {"fingerprint": fingerprint}},
+        {"$set": {"risktoken_enc": encrypt(risktoken)}},
     )
-
-    await send_message(chat_id, "\u2705 Fingerprint disimpan.")
-
+    await send_message(chat_id, "✅ Risktoken disimpan.")
 
 async def command_set_group(
     chat_id: int,
