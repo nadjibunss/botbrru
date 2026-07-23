@@ -55,8 +55,23 @@ async def _get(
 
 
 def _safe_text(text: str) -> str:
-    """Strip surrogate chars that cannot be UTF-8 encoded (e.g. from Shopee API)."""
-    return text.encode("utf-8", errors="ignore").decode("utf-8")
+    """Handle surrogate chars from external APIs (e.g. emoji in Shopee usernames).
+
+    Surrogate pairs like \uD83D\uDE00 are converted back to real emoji (e.g. 😀).
+    Only lone/unpaired surrogates that cannot be fixed are stripped as last resort.
+    """
+    try:
+        text.encode("utf-8")
+        return text  # already valid UTF-8, no changes needed
+    except UnicodeEncodeError:
+        # Try to preserve emoji: re-encode surrogate pairs via utf-16
+        try:
+            fixed = text.encode("utf-16", errors="surrogatepass").decode("utf-16")
+            fixed.encode("utf-8")  # verify now valid
+            return fixed
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            # Last resort: strip unpaired lone surrogates only
+            return text.encode("utf-8", errors="ignore").decode("utf-8")
 
 
 async def send_message(
