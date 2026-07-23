@@ -19,6 +19,8 @@ class SessionValidation:
     valid: bool
     account_username: str | None = None
     reason: str | None = None
+    has_phone: bool | None = None
+    requires_captcha: bool = False
 
 
 def utc_now() -> datetime:
@@ -39,9 +41,9 @@ def _extract_csrftoken(cookie: str) -> str:
     return ""
 
 
-def _build_shopee_headers(cookie: str) -> dict[str, str]:
+def _build_shopee_headers(cookie: str, risktoken: str | None = None) -> dict[str, str]:
     """Build headers required for Shopee API requests."""
-    return {
+    headers = {
         "Cookie": cookie,
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -58,20 +60,29 @@ def _build_shopee_headers(cookie: str) -> dict[str, str]:
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-origin",
     }
+    if risktoken:
+        headers["x-sz-secsdk-token"] = risktoken
+    return headers
 
 
-async def validate_cookie(cookie: str) -> SessionValidation:
+async def validate_cookie(cookie: str, risktoken: str | None = None) -> SessionValidation:
     """
     Validate a cookie by hitting Shopee's get_profile endpoint.
 
-    Always hits the profile endpoint to validate AND retrieve username.
-    If SESSION_VALIDATION_URL is also configured, hits that as additional check.
+    If risktoken is provided, it is sent as x-sz-secsdk-token header
+    and appended as RiskSessionID to the cookie string.
+
     Does not automate login, password, or OTP.
     """
     if not is_cookie_shape_valid(cookie):
         return SessionValidation(False, reason="Format cookie tidak valid")
 
-    headers = _build_shopee_headers(cookie)
+    # Append RiskSessionID to cookie if risktoken provided
+    effective_cookie = cookie
+    if risktoken:
+        effective_cookie = f"{cookie}; RiskSessionID={risktoken}"
+
+    headers = _build_shopee_headers(effective_cookie, risktoken=risktoken)
 
     # --- Primary validation: Shopee get_profile ---
     try:
@@ -82,51 +93,73 @@ async def validate_cookie(cookie: str) -> SessionValidation:
         return SessionValidation(False, reason="Tidak bisa terhubung ke Shopee")
 
     username: str | None = None
+    has_phone: bool | None = None
 
     if response.status_code == 200:
         try:
             body = response.json()
-            data = body.get("data", {})
-            user_profile = data.get("user_profile", {})
-
-            if user_profile:
-                username = (
-                    user_profile.get("username")
-                    or user_profile.get("nickname")
-                )
-                # Also check if is_login is explicitly false
-                if body.get("is_login") is False:
-                    return SessionValidation(
-                        False, reason="Cookie sudah tidak valid (not logged in)"
-                    )
-
-                # Success: profile found
-            else:
-                # No user_profile in response, check is_login
-                if body.get("is_login") is False:
-                    return SessionValidation(
-                        False, reason="Cookie sudah tidak valid (not logged in)"
-                    )
         except (ValueError, AttributeError, TypeError):
-            pass
+            body = {}
+
+        # Detect captcha/fingerprint requirement
+        error_code = body.get("error")
+        if error_code in (4, 40001, 40002) or body.get("captcha_verification_required"):
+            return SessionValidation(
+                False,
+                requires_captcha=True,
+                reason="Fingerprint/CAPTCHA diperlukan",
+            )
+
+        data = body.get("data", {})
+        user_profile = data.get("user_profile", {}) if isinstance(data, dict) else {}
+
+        if user_profile:
+            username = (
+                user_profile.get("username")
+                or user_profile.get("nickname")
+            )
+
+            # Extract has_phone
+            phone_value = user_profile.get("phone") or user_profile.get("phone_number")
+            has_phone = bool(phone_value)
+
+            # Check if is_login is explicitly false
+            if body.get("is_login") is False:
+                return SessionValidation(
+                    False, reason="Cookie sudah tidak valid (not logged in)"
+                )
+        else:
+            # No user_profile in response, check is_login
+            if body.get("is_login") is False:
+                return SessionValidation(
+                    False, reason="Cookie sudah tidak valid (not logged in)"
+                )
 
     elif response.status_code == 401:
         return SessionValidation(False, reason="Cookie sudah tidak valid atau expired")
 
     elif response.status_code == 403:
-        # 403 with is_login: true means anti-bot, not invalid session
         try:
             body = response.json()
-            if body.get("is_login") is True:
-                # Anti-bot block, cookie is still valid
-                username = None  # Cannot retrieve username due to block
-            else:
-                return SessionValidation(
-                    False, reason="Cookie sudah tidak valid atau expired"
-                )
         except (ValueError, AttributeError, TypeError):
-            # Cannot parse body, assume anti-bot
-            pass
+            body = {}
+
+        # Detect captcha/fingerprint on 403
+        error_code = body.get("error")
+        if body.get("is_login") is True and error_code in (4, 40001, 40002):
+            return SessionValidation(
+                False,
+                requires_captcha=True,
+                reason="Fingerprint/CAPTCHA diperlukan",
+            )
+
+        if body.get("is_login") is True:
+            # Anti-bot block, cookie is still valid
+            username = None
+        else:
+            return SessionValidation(
+                False, reason="Cookie sudah tidak valid atau expired"
+            )
 
     else:
         return SessionValidation(
@@ -134,18 +167,4 @@ async def validate_cookie(cookie: str) -> SessionValidation:
             reason=f"Shopee mengembalikan HTTP {response.status_code}",
         )
 
-    # --- Optional additional validation via SESSION_VALIDATION_URL ---
-    extra_url = settings.session_validation_url.strip()
-    if extra_url:
-        try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                extra_response = await client.get(extra_url, headers=headers)
-
-            if extra_response.status_code in (401, 403):
-                return SessionValidation(
-                    False, reason="Cookie tidak valid (validasi tambahan gagal)"
-                )
-        except httpx.HTTPError:
-            logger.warning("Additional validation endpoint unreachable, skipping")
-
-    return SessionValidation(True, account_username=username)
+    return SessionValidation(True, account_username=username, has_phone=has_phone)
