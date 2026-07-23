@@ -20,6 +20,7 @@ from src.utils.telegram import delete_message, send_message
 logger = logging.getLogger(__name__)
 
 STATE_AWAITING_COOKIE = "awaiting_cookie"
+STATE_AWAITING_RISKTOKEN = "awaiting_risktoken"
 STATE_AWAITING_BOT_TOKEN = "awaiting_bot_token"
 STATE_AWAITING_FINGERPRINT = "awaiting_fingerprint"
 
@@ -176,6 +177,10 @@ async def route_command(
         # Sengaja tanpa pesan \u2014 input silent
         return
 
+    if command == "/skip":
+        await command_skip_risktoken(chat_id, user_id)
+        return
+
     if command == "/setfingerprint":
         await command_set_fingerprint(chat_id, user_id, args)
         return
@@ -221,6 +226,10 @@ async def route_setup_input(
 
     if state == STATE_AWAITING_COOKIE:
         await receive_cookie(chat_id, user_id, text, message_id)
+        return
+
+    if state == STATE_AWAITING_RISKTOKEN:
+        await receive_risktoken(chat_id, user_id, text, message_id)
         return
 
     if state == STATE_AWAITING_BOT_TOKEN:
@@ -278,6 +287,7 @@ async def receive_cookie(
     db = await get_db()
     phone_info = "\ud83d\udcf1 Ada nomor HP" if result.has_phone else "\ud83d\udcf5 No Phone"
 
+    # Step 1 done: cookie valid. Save and ask for risktoken.
     await db.users.update_one(
         {"telegram_id": user_id},
         {
@@ -287,18 +297,62 @@ async def receive_cookie(
                 "cookie_verified_at": now,
                 "account_username": result.account_username,
                 "account_has_phone": result.has_phone,
-                "setup_state": None,
+                "setup_state": STATE_AWAITING_RISKTOKEN,
                 "setup_payload": {},
             }
         },
     )
     await send_message(
         chat_id,
-        f"\u2705 <b>Login Shopee berhasil!</b>\n\n"
-        f"\ud83d\udc64 Username: <b>{html.escape(result.account_username or '-')}</b>\n"
-        f"{phone_info}\n\n"
-        f"Gunakan /start_monitor untuk mulai monitoring.\n"
-        f"Jika sesi berakhir, jalankan /setcredentials kembali.",
+        f"\u2705 Cookie valid! Akun: <b>{html.escape(result.account_username or '-')}</b> {phone_info}\n\n"
+        f"\ud83d\udd11 Sekarang kirim <b>risktoken</b> kamu.\n\n"
+        f"Risktoken = device fingerprint agar request ke Shopee terlihat seperti browser asli.\n"
+        f"Format: <code>base64==|...|08|1</code>\n\n"
+        f"Ketik /skip kalau tidak punya (monitoring mungkin kena anti-bot).",
+    )
+
+
+async def receive_risktoken(
+    chat_id: int,
+    user_id: int,
+    text: str,
+    message_id: int,
+) -> None:
+    """Step 2 of setup: receive and save risktoken."""
+    await delete_message(chat_id, message_id)
+
+    risktoken = text.strip()
+    db = await get_db()
+    await db.users.update_one(
+        {"telegram_id": user_id},
+        {"$set": {
+            "risktoken_enc": encrypt(risktoken),
+            "setup_state": None,
+            "setup_payload": {},
+        }},
+    )
+    await send_message(
+        chat_id,
+        "\u2705 Setup selesai! Cookie + risktoken tersimpan.\n\n"
+        "Gunakan /start_monitor untuk mulai monitoring.",
+    )
+
+
+async def command_skip_risktoken(chat_id: int, user_id: int) -> None:
+    """Skip risktoken step, finish setup without it."""
+    db = await get_db()
+    user = await db.users.find_one({"telegram_id": user_id})
+    if not user or user.get("setup_state") != STATE_AWAITING_RISKTOKEN:
+        await send_message(chat_id, "\u2139\ufe0f Tidak ada setup yang sedang berjalan.")
+        return
+    await db.users.update_one(
+        {"telegram_id": user_id},
+        {"$set": {"setup_state": None, "setup_payload": {}}},
+    )
+    await send_message(
+        chat_id,
+        "\u23e9 Risktoken dilewati. Cookie tersimpan tanpa fingerprint.\n\n"
+        "Monitoring mungkin kena anti-bot Shopee. Gunakan /start_monitor untuk mulai.",
     )
 
 
