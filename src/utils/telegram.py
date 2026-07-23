@@ -1,4 +1,4 @@
-Telegram Bot API client.
+"""Telegram Bot API client."""
 from __future__ import annotations
 
 import logging
@@ -59,7 +59,7 @@ async def send_message(
     text: str,
     token: str | None = None,
 ) -> dict:
-    Send HTML-formatted Telegram message.
+    """Send HTML-formatted Telegram message."""
     return await _post(
         "sendMessage",
         {
@@ -77,7 +77,7 @@ async def delete_message(
     message_id: int,
     token: str | None = None,
 ) -> bool:
-    Try deleting sensitive input after it is processed.
+    """Try deleting sensitive input after it is processed."""
     result = await _post(
         "deleteMessage",
         {"chat_id": chat_id, "message_id": message_id},
@@ -87,7 +87,7 @@ async def delete_message(
 
 
 async def delete_webhook() -> dict:
-    Disable webhook before polling.
+    """Disable webhook before polling."""
     return await _post(
         "deleteWebhook",
         {"drop_pending_updates": False},
@@ -95,7 +95,7 @@ async def delete_webhook() -> dict:
 
 
 async def get_updates(offset: int, timeout: int = 30) -> list[dict]:
-    Receive Telegram updates with long polling.
+    """Receive Telegram updates with long polling."""
     data = await _get(
         "getUpdates",
         {
