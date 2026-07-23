@@ -121,21 +121,27 @@ async def _monitor_loop(telegram_id: int) -> None:
             try:
                 cookie = decrypt(cookie_enc)
             except ValueError:
-                await _disable_for_expired_session(
+                await _disable_for_expiredSession(
                     telegram_id,
                     "data cookie tidak dapat dibaca",
                 )
                 return
 
-            # Re-validasi sesi lewat endpoint resmi (jika dikonfigurasi)
-            if settings.session_validation_url.strip():
-                session = await validate_cookie(cookie)
-                if not session.valid:
-                    await _disable_for_expired_session(
-                        telegram_id,
-                        session.reason or "cookie tidak valid",
-                    )
-                    return
+            # Selalu validasi sesi sebelum hit Shopee search API
+            session = await validate_cookie(cookie)
+            if not session.valid:
+                await _disable_for_expiredSession(
+                    telegram_id,
+                    session.reason or "cookie tidak valid",
+                )
+                return
+
+            # Update username jika berhasil diambil
+            if session.account_username:
+                await db.users.update_one(
+                    {"telegram_id": telegram_id},
+                    {"$set": {"account_username": session.account_username}},
+                )
 
             # --- Shopee Search API monitoring ---
             keywords_raw = user.get("keywords") or settings.default_keywords
@@ -215,7 +221,7 @@ async def _monitor_loop(telegram_id: int) -> None:
                         f"📦 {name}\n"
                         f"💰 Rp{price:,.0f}\n"
                         f"📍 {location}\n"
-                        f"🔗 {link}"
+                        f"🔗 {lolink}"
                     )
 
                     await send_message(target_chat, notification, token=bot_token)
