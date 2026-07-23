@@ -1,4 +1,4 @@
-MongoDB user document defaults.
+"""MongoDB user document defaults."""
 
 DEFAULT_USER_DOC = {
     "telegram_id": None,
