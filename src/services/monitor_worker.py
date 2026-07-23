@@ -115,6 +115,15 @@ async def _monitor_loop(telegram_id: int) -> None:
                 )
                 return
 
+            # Load risktoken if stored
+            risktoken: str | None = None
+            risktoken_enc = user.get("risktoken_enc")
+            if risktoken_enc:
+                try:
+                    risktoken = decrypt(risktoken_enc)
+                except ValueError:
+                    risktoken = None
+
             try:
                 cookie = decrypt(cookie_enc)
             except ValueError:
@@ -141,7 +150,7 @@ async def _monitor_loop(telegram_id: int) -> None:
 
             for keyword in keywords:
                 try:
-                    items = await _search_shopee(cookie, keyword)
+                    items = await _search_shopee(cookie, keyword, risktoken=risktoken)
                 except AntiBotError as e:
                     logger.warning(
                         "Anti-bot block untuk user=%s keyword=%s: %s",
@@ -236,7 +245,7 @@ async def _monitor_loop(telegram_id: int) -> None:
         _workers.pop(telegram_id, None)
 
 
-async def _search_shopee(cookie: str, keyword: str) -> list[dict]:
+async def _search_shopee(cookie: str, keyword: str, risktoken: str | None = None) -> list[dict]:
     """
     Hit Shopee Indonesia search API with user's session cookie.
     Returns list of item dicts.
@@ -259,10 +268,15 @@ async def _search_shopee(cookie: str, keyword: str) -> list[dict]:
         "fs_only": 0,
     }
 
-    csrf_token = _extract_csrftoken(cookie)
+    # Append RiskSessionID to cookie if risktoken provided
+    effective_cookie = cookie
+    if risktoken:
+        effective_cookie = f"{cookie}; RiskSessionID={risktoken}"
+
+    csrf_token = _extract_csrftoken(effective_cookie)
 
     headers = {
-        "Cookie": cookie,
+        "Cookie": effective_cookie,
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -285,6 +299,8 @@ async def _search_shopee(cookie: str, keyword: str) -> list[dict]:
 
     if csrf_token:
         headers["x-csrftoken"] = csrf_token
+    if risktoken:
+        headers["x-sz-secsdk-token"] = risktoken
 
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.get(
