@@ -54,58 +54,24 @@ async def _get(
         return {"ok": False}
 
 
+def _safe_text(text: str) -> str:
+    """Strip surrogate chars that cannot be UTF-8 encoded (e.g. from Shopee API)."""
+    return text.encode("utf-8", errors="ignore").decode("utf-8")
+
+
 async def send_message(
     chat_id: int | str,
     text: str,
     token: str | None = None,
 ) -> dict:
-    """Send HTML-formatted Telegram message."""
+    \"\"\"Send HTML-formatted Telegram message.\"\"\"
     return await _post(
         "sendMessage",
         {
             "chat_id": chat_id,
-            "text": text,
+            "text": _safe_text(text),
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
         },
         token,
     )
-
-
-async def delete_message(
-    chat_id: int | str,
-    message_id: int,
-    token: str | None = None,
-) -> bool:
-    """Try deleting sensitive input after it is processed."""
-    result = await _post(
-        "deleteMessage",
-        {"chat_id": chat_id, "message_id": message_id},
-        token,
-    )
-    return bool(result.get("ok"))
-
-
-async def delete_webhook() -> dict:
-    """Disable webhook before polling."""
-    return await _post(
-        "deleteWebhook",
-        {"drop_pending_updates": False},
-    )
-
-
-async def get_updates(offset: int, timeout: int = 30) -> list[dict]:
-    """Receive Telegram updates with long polling."""
-    data = await _get(
-        "getUpdates",
-        {
-            "offset": offset,
-            "timeout": timeout,
-            "allowed_updates": ["message"],
-        },
-    )
-
-    if not data.get("ok"):
-        return []
-
-    return data.get("result", [])
