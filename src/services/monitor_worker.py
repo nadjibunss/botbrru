@@ -90,7 +90,7 @@ async def _disable_for_expired_session(telegram_id: int, reason: str) -> None:
 
     await send_message(
         telegram_id,
-        f"\u26a0\ufe0f Sesi berakhir: {reason}\n\n"
+        f"⚠️ Sesi berakhir: {reason}\n\n"
         "Monitoring dinonaktifkan. Jalankan /setcredentials untuk mengirim cookie baru.",
     )
 
@@ -114,7 +114,7 @@ async def _monitor_loop(telegram_id: int) -> None:
                 )
                 await send_message(
                     telegram_id,
-                    "\u26a0\ufe0f Cookie sesi tidak tersedia. Jalankan /setcredentials.",
+                    "⚠️ Cookie sesi tidak tersedia. Jalankan /setcredentials.",
                 )
                 return
 
@@ -211,11 +211,11 @@ async def _monitor_loop(telegram_id: int) -> None:
                     link = f"https://shopee.co.id/{quote_plus(shop_name)}-i.{shop_id}.{item_id}"
 
                     notification = (
-                        f"\ud83d\udfe2 STOK TERSEDIA!\n"
-                        f"\ud83d\udce6 {name}\n"
-                        f"\ud83d\udcb0 Rp{price:,.0f}\n"
-                        f"\ud83d\udccd {location}\n"
-                        f"\ud83d\udd17 {link}"
+                        f"🟢 STOK TERSEDIA!\n"
+                        f"📦 {name}\n"
+                        f"💰 Rp{price:,.0f}\n"
+                        f"📍 {location}\n"
+                        f"🔗 {link}"
                     )
 
                     await send_message(target_chat, notification, token=bot_token)
