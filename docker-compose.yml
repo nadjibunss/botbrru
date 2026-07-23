@@ -1,0 +1,25 @@
+services:
+  app:
+    build: .
+    env_file:
+      - .env
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8000:8000"
+
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  mongo_data:
