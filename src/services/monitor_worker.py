@@ -13,7 +13,6 @@ from urllib.parse import quote_plus
 import httpx
 
 from src.config import settings
-from src.services.session_service import validate_cookie
 from src.utils.crypto import decrypt
 from src.utils.database import get_db
 from src.utils.telegram import send_message
@@ -73,8 +72,8 @@ def is_worker_running(telegram_id: int) -> bool:
     return bool(task and not task.done())
 
 
-async def _disable_for_expired_session(telegram_id: int, reason: str) -> None:
-    """Stop monitor and ask user to refresh cookie only (no password/OTP)."""
+async def _disable_for_expired_session(telegram_id: int) -> None:
+    """Stop monitor and notify user. Keep cookie for reference (do not clear)."""
     db = await get_db()
 
     await db.users.update_one(
@@ -82,16 +81,14 @@ async def _disable_for_expired_session(telegram_id: int, reason: str) -> None:
         {
             "$set": {
                 "monitoring_active": False,
-                "cookie_enc": None,
-                "account_username": None,
             }
         },
     )
 
     await send_message(
         telegram_id,
-        f"⚠️ Sesi berakhir: {reason}\n\n"
-        "Monitoring dinonaktifkan. Jalankan /setcredentials untuk mengirim cookie baru.",
+        "\u26a0\ufe0f Sesi Shopee berakhir.\n\n"
+        "Monitoring dihentikan. Jalankan /setcredentials untuk cookie baru.",
     )
 
 
@@ -114,34 +111,15 @@ async def _monitor_loop(telegram_id: int) -> None:
                 )
                 await send_message(
                     telegram_id,
-                    "⚠️ Cookie sesi tidak tersedia. Jalankan /setcredentials.",
+                    "\u26a0\ufe0f Cookie sesi tidak tersedia. Jalankan /setcredentials.",
                 )
                 return
 
             try:
                 cookie = decrypt(cookie_enc)
             except ValueError:
-                await _disable_for_expiredSession(
-                    telegram_id,
-                    "data cookie tidak dapat dibaca",
-                )
+                await _disable_for_expired_session(telegram_id)
                 return
-
-            # Selalu validasi sesi sebelum hit Shopee search API
-            session = await validate_cookie(cookie)
-            if not session.valid:
-                await _disable_for_expiredSession(
-                    telegram_id,
-                    session.reason or "cookie tidak valid",
-                )
-                return
-
-            # Update username jika berhasil diambil
-            if session.account_username:
-                await db.users.update_one(
-                    {"telegram_id": telegram_id},
-                    {"$set": {"account_username": session.account_username}},
-                )
 
             # --- Shopee Search API monitoring ---
             keywords_raw = user.get("keywords") or settings.default_keywords
@@ -175,10 +153,7 @@ async def _monitor_loop(telegram_id: int) -> None:
                     await asyncio.sleep(random.uniform(60, 120))
                     continue
                 except SessionExpiredError:
-                    await _disable_for_expired_session(
-                        telegram_id,
-                        "Cookie tidak valid atau expired",
-                    )
+                    await _disable_for_expired_session(telegram_id)
                     return
                 except Exception:
                     logger.exception(
@@ -217,11 +192,11 @@ async def _monitor_loop(telegram_id: int) -> None:
                     link = f"https://shopee.co.id/{quote_plus(shop_name)}-i.{shop_id}.{item_id}"
 
                     notification = (
-                        f"🟢 STOK TERSEDIA!\n"
-                        f"📦 {name}\n"
-                        f"💰 Rp{price:,.0f}\n"
-                        f"📍 {location}\n"
-                        f"🔗 {lolink}"
+                        f"\ud83d\udfe2 STOK TERSEDIA!\n"
+                        f"\ud83d\udce6 {name}\n"
+                        f"\ud83d\udcb0 Rp{price:,.0f}\n"
+                        f"\ud83d\udccd {location}\n"
+                        f"\ud83d\udd17 {link}"
                     )
 
                     await send_message(target_chat, notification, token=bot_token)
