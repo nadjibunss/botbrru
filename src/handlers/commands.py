@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 STATE_AWAITING_COOKIE = "awaiting_cookie"
 STATE_AWAITING_BOT_TOKEN = "awaiting_bot_token"
+STATE_AWAITING_FINGERPRINT = "awaiting_fingerprint"
 
 
 async def handle_update(update: dict) -> None:
@@ -47,14 +48,14 @@ async def handle_update(update: dict) -> None:
         if text.startswith("/setcredentials") or text.startswith("/setbot"):
             await send_message(
                 chat_id,
-                "❌ Jalankan perintah kredensial melalui private chat dengan bot.",
+                "\u274c Jalankan perintah kredensial melalui private chat dengan bot.",
             )
         return
 
     user = await ensure_user(user_id, telegram_username)
 
     if not user:
-        await send_message(chat_id, "❌ Database tidak tersedia.")
+        await send_message(chat_id, "\u274c Database tidak tersedia.")
         return
 
     if text.startswith("/"):
@@ -172,7 +173,7 @@ async def route_command(
             return
 
         await set_state(user_id, STATE_AWAITING_BOT_TOKEN)
-        # Sengaja tanpa pesan — input silent
+        # Sengaja tanpa pesan \u2014 input silent
         return
 
     if command == "/setfingerprint":
@@ -226,6 +227,10 @@ async def route_setup_input(
         await save_custom_bot_token(user_id, text, chat_id, delete_mid=message_id)
         return
 
+    if state == STATE_AWAITING_FINGERPRINT:
+        await receive_fingerprint(chat_id, user_id, text, message_id, user)
+        return
+
 
 async def receive_cookie(
     chat_id: int,
@@ -234,21 +239,44 @@ async def receive_cookie(
     message_id: int,
 ) -> None:
     """Validate and save a session cookie."""
-    result = await validate_cookie(cookie)
-
     # Hapus pesan cookie dari chat history (best effort)
     await delete_message(chat_id, message_id)
+
+    result = await validate_cookie(cookie)
+
+    if result.requires_captcha:
+        # Save pending cookie encrypted, ask for risktoken
+        pending_cookie_enc = encrypt(cookie)
+        await set_state(
+            user_id,
+            STATE_AWAITING_FINGERPRINT,
+            {"pending_cookie_enc": pending_cookie_enc},
+        )
+        await send_message(
+            chat_id,
+            "\u26a1 Fingerprint/CAPTCHA Shopee terdeteksi!\n\n"
+            "Untuk melanjutkan, kirim risktoken kamu.\n"
+            "Format: dGAOpcjLx9vrTGoRYEbfew==|...|08|1\n\n"
+            "Cara dapat risktoken:\n"
+            "- Buka shopee.co.id di browser\n"
+            "- Login atau refresh halaman\n"
+            "- F12 \u2192 Network \u2192 cari request ke /get_profile\n"
+            "- Lihat header x-sz-secsdk-token atau cookie RiskSessionID\n\n"
+            "Ketik /cancel untuk batal.",
+        )
+        return
 
     if not result.valid:
         reason = html.escape(result.reason or "Cookie tidak valid")
         await send_message(
             chat_id,
-            f"❌ {reason}\n\nKirim cookie baru atau ketik /cancel.",
+            f"\u274c {reason}\n\nKirim cookie baru atau ketik /cancel.",
         )
         return
 
     now = utc_now()
     db = await get_db()
+    phone_info = "\ud83d\udcf1 Ada nomor HP" if result.has_phone else "\ud83d\udcf5 No Phone"
 
     await db.users.update_one(
         {"telegram_id": user_id},
@@ -257,6 +285,7 @@ async def receive_cookie(
                 "cookie_enc": encrypt(cookie),
                 "cookie_verified_at": now,
                 "account_username": result.account_username,
+                "account_has_phone": result.has_phone,
                 "setup_state": None,
                 "setup_payload": {},
             }
@@ -264,9 +293,71 @@ async def receive_cookie(
     )
     await send_message(
         chat_id,
-        f"✅ <b>Login Shopee berhasil!</b>\n\n"
-        f"👤 Username: <b>{html.escape(result.account_username or '-')}</b>\n"
-        f"🆔 Akun terverifikasi dan cookie tersimpan.\n\n"
+        f"\u2705 <b>Login Shopee berhasil!</b>\n\n"
+        f"\ud83d\udc64 Username: <b>{html.escape(result.account_username or '-')}</b>\n"
+        f"{phone_info}\n\n"
+        f"Gunakan /start_monitor untuk mulai monitoring.\n"
+        f"Jika sesi berakhir, jalankan /setcredentials kembali.",
+    )
+
+
+async def receive_fingerprint(
+    chat_id: int,
+    user_id: int,
+    risktoken: str,
+    message_id: int,
+    user: dict,
+) -> None:
+    """Handle risktoken submission from user."""
+    await delete_message(chat_id, message_id)
+
+    # Get pending cookie from setup_payload
+    setup_payload = user.get("setup_payload") or {}
+    pending_cookie_enc = setup_payload.get("pending_cookie_enc")
+
+    if not pending_cookie_enc:
+        await send_message(chat_id, "\u274c Sesi setup expired. Jalankan /setcredentials lagi.")
+        return
+
+    try:
+        cookie = decrypt(pending_cookie_enc)
+    except ValueError:
+        await send_message(chat_id, "\u274c Data cookie rusak. Jalankan /setcredentials lagi.")
+        return
+
+    await send_message(chat_id, "\ud83d\udd0d Memverifikasi fingerprint...")
+    result = await validate_cookie(cookie, risktoken=risktoken.strip())
+
+    if result.requires_captcha:
+        await send_message(chat_id, "\u274c Fingerprint tidak valid. Coba risktoken lain atau /setcredentials ulang.")
+        return
+
+    if not result.valid:
+        await send_message(chat_id, f"\u274c {result.reason or 'Cookie tidak valid'}. Jalankan /setcredentials lagi.")
+        return
+
+    # Success \u2014 save cookie + clear state
+    now = utc_now()
+    db = await get_db()
+    phone_info = "\ud83d\udcf1 Ada nomor HP" if result.has_phone else "\ud83d\udcf5 No Phone"
+
+    await db.users.update_one(
+        {"telegram_id": user_id},
+        {"$set": {
+            "cookie_enc": pending_cookie_enc,
+            "cookie_verified_at": now,
+            "account_username": result.account_username,
+            "account_has_phone": result.has_phone,
+            "setup_state": None,
+            "setup_payload": {},
+        }}
+    )
+
+    await send_message(
+        chat_id,
+        f"\u2705 Login Shopee berhasil!\n\n"
+        f"\ud83d\udc64 Username: {html.escape(result.account_username or '-')}\n"
+        f"{phone_info}\n\n"
         f"Gunakan /start_monitor untuk mulai monitoring.\n"
         f"Jika sesi berakhir, jalankan /setcredentials kembali.",
     )
@@ -288,7 +379,7 @@ async def save_custom_bot_token(
         await delete_message(chat_id, delete_mid)
 
     if not is_token_shape_valid(token):
-        # Silent fail — jangan sebut token di balasan
+        # Silent fail \u2014 jangan sebut token di balasan
         return
 
     db = await get_db()
@@ -321,9 +412,9 @@ def is_token_shape_valid(token: str) -> bool:
 async def command_start(chat_id: int) -> None:
     """Send bot help."""
     text = (
-        "🤖 <b>Shopee Instant Stock Monitor</b>\n\n"
+        "\ud83e\udd16 <b>Shopee Instant Stock Monitor</b>\n\n"
         "<b>Setup aman:</b>\n"
-        "1. /setcredentials → kirim cookie sesi\n"
+        "1. /setcredentials \u2192 kirim cookie sesi\n"
         "2. /setfingerprint &lt;JSON&gt; (opsional)\n"
         "3. /setbot &lt;token&gt; (opsional, silent)\n"
         "4. /setgroup &lt;chat_id&gt; (opsional)\n"
@@ -345,18 +436,18 @@ async def command_set_fingerprint(
     if not args:
         await send_message(
             chat_id,
-            "❌ Format: /setfingerprint &lt;JSON object&gt;",
+            "\u274c Format: /setfingerprint &lt;JSON object&gt;",
         )
         return
 
     try:
         fingerprint = json.loads(args)
     except json.JSONDecodeError:
-        await send_message(chat_id, "❌ Fingerprint harus JSON valid.")
+        await send_message(chat_id, "\u274c Fingerprint harus JSON valid.")
         return
 
     if not isinstance(fingerprint, dict):
-        await send_message(chat_id, "❌ Fingerprint harus JSON object.")
+        await send_message(chat_id, "\u274c Fingerprint harus JSON object.")
         return
 
     db = await get_db()
@@ -366,7 +457,7 @@ async def command_set_fingerprint(
         {"$set": {"fingerprint": fingerprint}},
     )
 
-    await send_message(chat_id, "✅ Fingerprint disimpan.")
+    await send_message(chat_id, "\u2705 Fingerprint disimpan.")
 
 
 async def command_set_group(
@@ -378,7 +469,7 @@ async def command_set_group(
     try:
         group_chat_id = int(args)
     except ValueError:
-        await send_message(chat_id, "❌ Format: /setgroup &lt;chat_id_angka&gt;")
+        await send_message(chat_id, "\u274c Format: /setgroup &lt;chat_id_angka&gt;")
         return
 
     db = await get_db()
@@ -388,7 +479,7 @@ async def command_set_group(
         {"$set": {"group_chat_id": group_chat_id}},
     )
 
-    await send_message(chat_id, "✅ Group tujuan disimpan.")
+    await send_message(chat_id, "\u2705 Group tujuan disimpan.")
 
 
 async def command_set_keywords(
@@ -402,7 +493,7 @@ async def command_set_keywords(
     if not keywords:
         await send_message(
             chat_id,
-            "❌ Format: /setkeywords kata1 | kata2 | kata3",
+            "\u274c Format: /setkeywords kata1 | kata2 | kata3",
         )
         return
 
@@ -415,7 +506,7 @@ async def command_set_keywords(
 
     await send_message(
         chat_id,
-        f"✅ Keywords: <b>{html.escape(', '.join(keywords))}</b>",
+        f"\u2705 Keywords: <b>{html.escape(', '.join(keywords))}</b>",
     )
 
 
@@ -428,7 +519,7 @@ async def command_set_area(
     area = args.strip()
 
     if not area:
-        await send_message(chat_id, "❌ Format: /setarea &lt;nama area&gt;")
+        await send_message(chat_id, "\u274c Format: /setarea &lt;nama area&gt;")
         return
 
     db = await get_db()
@@ -438,7 +529,7 @@ async def command_set_area(
         {"$set": {"area": area}},
     )
 
-    await send_message(chat_id, f"✅ Area: <b>{html.escape(area)}</b>")
+    await send_message(chat_id, f"\u2705 Area: <b>{html.escape(area)}</b>")
 
 
 async def command_start_monitor(
@@ -452,27 +543,27 @@ async def command_start_monitor(
     if not user or not user.get("cookie_enc"):
         await send_message(
             chat_id,
-            "❌ Jalankan /setcredentials sebelum memulai monitoring.",
+            "\u274c Jalankan /setcredentials sebelum memulai monitoring.",
         )
         return
 
-    # Validasi cookie ke Shopee sebelum mulai — pastikan sudah login
+    # Validasi cookie ke Shopee sebelum mulai \u2014 pastikan sudah login
     try:
         cookie = decrypt(user["cookie_enc"])
     except ValueError:
         await send_message(
             chat_id,
-            "❌ Cookie tidak dapat dibaca. Jalankan /setcredentials untuk kirim cookie baru.",
+            "\u274c Cookie tidak dapat dibaca. Jalankan /setcredentials untuk kirim cookie baru.",
         )
         return
 
-    await send_message(chat_id, "🔍 Memeriksa sesi Shopee...")
+    await send_message(chat_id, "\ud83d\udd0d Memeriksa sesi Shopee...")
     session = await validate_cookie(cookie)
 
     if not session.valid:
         await send_message(
             chat_id,
-            f"❌ Sesi Shopee tidak valid: {session.reason}\n\n"
+            f"\u274c Sesi Shopee tidak valid: {session.reason}\n\n"
             "Jalankan /setcredentials untuk kirim cookie baru.",
         )
         return
@@ -484,9 +575,9 @@ async def command_start_monitor(
     )
 
     if await start_worker(user_id):
-        await send_message(chat_id, f"▶️ Monitoring dimulai{username_info}.")
+        await send_message(chat_id, f"\u25b6\ufe0f Monitoring dimulai{username_info}.")
     else:
-        await send_message(chat_id, "ℹ️ Monitoring sudah berjalan.")
+        await send_message(chat_id, "\u2139\ufe0f Monitoring sudah berjalan.")
 
 
 async def command_stop_monitor(
@@ -503,7 +594,7 @@ async def command_stop_monitor(
         {"$set": {"monitoring_active": False}},
     )
 
-    await send_message(chat_id, "⏹️ Monitoring dihentikan.")
+    await send_message(chat_id, "\u23f9\ufe0f Monitoring dihentikan.")
 
 
 async def command_status(
@@ -515,20 +606,30 @@ async def command_status(
     user = await db.users.find_one({"telegram_id": user_id}) or {}
 
     active = is_worker_running(user_id)
-    cookie_status = "✅" if user.get("cookie_enc") else "❌"
-    bot_status = "✅" if user.get("custom_bot_token_enc") else "➖"
-    group_status = "✅" if user.get("group_chat_id") else "➖"
+    cookie_status = "\u2705" if user.get("cookie_enc") else "\u274c"
+    bot_status = "\u2705" if user.get("custom_bot_token_enc") else "\u2796"
+    group_status = "\u2705" if user.get("group_chat_id") else "\u2796"
 
     account = html.escape(user.get("account_username") or "-")
     area = html.escape(user.get("area") or settings.default_area)
     keywords = html.escape(user.get("keywords") or settings.default_keywords)
 
-    status_icon = "🟢" if active else "🔴"
+    # Phone status
+    has_phone = user.get("account_has_phone")
+    if has_phone is True:
+        phone_status = "\ud83d\udcf1 Ada HP"
+    elif has_phone is False:
+        phone_status = "\ud83d\udcf5 No Phone"
+    else:
+        phone_status = "\u2796"
+
+    status_icon = "\ud83d\udfe2" if active else "\ud83d\udd34"
     status_text = "Aktif" if active else "Tidak aktif"
     text = (
         f"{status_icon} <b>Status:</b> "
         f"{status_text}\n\n"
         f"<b>Akun:</b> {account}\n"
+        f"<b>Phone:</b> {phone_status}\n"
         f"<b>Cookie:</b> {cookie_status}\n"
         f"<b>Custom bot:</b> {bot_status}\n"
         f"<b>Group:</b> {group_status}\n"
@@ -551,7 +652,7 @@ async def command_reset(
         {"$set": {"checked_items": []}},
     )
 
-    await send_message(chat_id, "🔄 Daftar item yang sudah diperiksa direset.")
+    await send_message(chat_id, "\ud83d\udd04 Daftar item yang sudah diperiksa direset.")
 
 
 def resolve_custom_bot_token(user: dict) -> str | None:
