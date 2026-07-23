@@ -25,6 +25,25 @@ _workers: dict[int, asyncio.Task] = {}
 SHOPEE_SEARCH_URL = "https://shopee.co.id/api/v4/search/search_items"
 
 
+class SessionExpiredError(Exception):
+    """Raised when Shopee returns genuine session-expired (401 or is_login=false)."""
+    pass
+
+
+class AntiBotError(Exception):
+    """Raised when Shopee anti-bot blocks the request (not a session issue)."""
+    pass
+
+
+def _extract_csrftoken(cookie: str) -> str:
+    """Extract csrftoken value from a cookie header string."""
+    for part in cookie.split(";"):
+        part = part.strip()
+        if part.startswith("csrftoken="):
+            return part.split("=", 1)[1]
+    return ""
+
+
 async def start_worker(telegram_id: int) -> bool:
     """Start one monitoring task per Telegram user."""
     current = _workers.get(telegram_id)
@@ -139,10 +158,20 @@ async def _monitor_loop(telegram_id: int) -> None:
             for keyword in keywords:
                 try:
                     items = await _search_shopee(cookie, keyword)
+                except AntiBotError as e:
+                    logger.warning(
+                        "Anti-bot block untuk user=%s keyword=%s: %s",
+                        telegram_id,
+                        keyword,
+                        e,
+                    )
+                    # Jangan disable monitoring, cukup sleep lebih lama dan lanjut
+                    await asyncio.sleep(random.uniform(60, 120))
+                    continue
                 except SessionExpiredError:
                     await _disable_for_expired_session(
                         telegram_id,
-                        "Cookie tidak valid atau expired (401/403)",
+                        "Cookie tidak valid atau expired",
                     )
                     return
                 except Exception:
@@ -226,35 +255,55 @@ async def _monitor_loop(telegram_id: int) -> None:
         _workers.pop(telegram_id, None)
 
 
-class SessionExpiredError(Exception):
-    """Raised when Shopee returns 401/403."""
-    pass
-
-
 async def _search_shopee(cookie: str, keyword: str) -> list[dict]:
     """
     Hit Shopee Indonesia search API with user's session cookie.
     Returns list of item dicts.
+
+    Raises:
+        SessionExpiredError: when the session is genuinely expired (401 or is_login=false)
+        AntiBotError: when Shopee anti-bot blocks the request (cookie still valid)
     """
     params = {
         "keyword": keyword,
         "limit": 30,
+        "newest": 0,
         "order": "asc",
         "page_type": "search",
         "scenario": "PAGE_GLOBAL_SEARCH",
         "version": 2,
+        "by": "relevancy",
+        "match_id": 0,
+        "src": "search",
+        "fs_only": 0,
     }
+
+    csrf_token = _extract_csrftoken(cookie)
 
     headers = {
         "Cookie": cookie,
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
+            "Chrome/124.0.0.0 Safari/537.36"
         ),
         "Referer": f"https://shopee.co.id/search?keyword={quote_plus(keyword)}",
         "X-Requested-With": "XMLHttpRequest",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
+        "x-shopee-language": "id",
+        "x-api-source": "pc",
+        "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
     }
+
+    if csrf_token:
+        headers["x-csrftoken"] = csrf_token
 
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.get(
@@ -263,20 +312,57 @@ async def _search_shopee(cookie: str, keyword: str) -> list[dict]:
             headers=headers,
         )
 
-    if response.status_code in (401, 403):
-        raise SessionExpiredError("Unauthorized")
+    # --- Error handling: distinguish session-expired vs anti-bot ---
 
-    # Cek response body untuk indikasi unauthorized
+    if response.status_code == 401:
+        raise SessionExpiredError("HTTP 401 - Unauthorized")
+
+    if response.status_code == 403:
+        try:
+            body = response.json()
+        except Exception:
+            # Can't parse body, assume anti-bot (not session expired)
+            raise AntiBotError(f"HTTP 403, non-JSON response")
+
+        is_login = body.get("is_login", True)
+        if not is_login:
+            raise SessionExpiredError("Session tidak valid (is_login=false)")
+        else:
+            error_code = body.get("error") or body.get("error_msg") or ""
+            raise AntiBotError(f"Anti-bot block (403): {error_code}")
+
+    # Parse response body
     try:
         body = response.json()
     except Exception:
         logger.warning("Non-JSON response from Shopee search: %s", response.status_code)
         return []
 
-    # Cek error di response body
-    error_msg = body.get("error_msg") or body.get("error") or ""
-    if "unauthorized" in str(error_msg).lower():
-        raise SessionExpiredError(error_msg)
+    # Check for error codes in body (e.g. 90309999 = anti-bot)
+    error_code = body.get("error")
+    error_msg = body.get("error_msg") or ""
+
+    if error_code:
+        # Check if it's genuinely unauthorized
+        is_login = body.get("is_login", True)
+
+        if not is_login:
+            raise SessionExpiredError(f"Session expired: {error_msg}")
+
+        # Error code present but is_login=true means anti-bot, not session issue
+        if error_code == 90309999 or "bot" in str(error_msg).lower():
+            raise AntiBotError(f"Anti-bot error {error_code}: {error_msg}")
+
+        # Other errors with is_login=true: treat as anti-bot/transient, not session expired
+        if isinstance(error_code, int) and error_code != 0:
+            raise AntiBotError(f"Shopee error {error_code}: {error_msg}")
+
+        # String error codes that indicate unauthorized
+        if isinstance(error_code, str) and "unauthorized" in error_code.lower():
+            if not is_login:
+                raise SessionExpiredError(error_msg)
+            else:
+                raise AntiBotError(f"Blocked: {error_code}")
 
     # Parse items - coba kedua struktur response
     items = []
