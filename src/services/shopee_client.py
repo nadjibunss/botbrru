@@ -1,19 +1,22 @@
 """
 src/services/shopee_client.py
-Async Shopee API client with anti-bot resilience.
+Async Shopee client with anti-bot resilience — web-scraping approach.
 
 Strategy overview
 ─────────────────
-1. Realistic browser headers (see utils/headers.py).
+1. Realistic browser headers mimicking a real HTML page fetch.
 2. Optional SECSDK risktoken forwarded verbatim from the user's browser.
-3. Conservative error classification: distinguish session expiry, captcha,
+3. Parse __NEXT_DATA__ JSON embedded in the HTML response instead of
+   hitting the internal API directly (which returns 403 anti-bot).
+4. Conservative error classification: distinguish session expiry, captcha,
    generic anti-bot, and rate-limiting so callers react appropriately.
-4. Exponential-backoff retry on transient network errors and HTTP 429.
-5. Optional residential proxy via PROXY_URL environment variable.
+5. Exponential-backoff retry on transient network errors and HTTP 429.
+6. Optional residential proxy via PROXY_URL environment variable.
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
 import re
@@ -29,9 +32,15 @@ from src.utils.headers import build_profile_headers, build_search_headers
 
 logger = logging.getLogger(__name__)
 
-# ── Shopee API endpoints ──────────────────────────────────────────────────
-SHOPEE_SEARCH_URL = "https://shopee.co.id/api/v4/search/search_items"
+# ── Shopee endpoints ──────────────────────────────────────────────────────
+SHOPEE_SEARCH_PAGE_URL = "https://shopee.co.id/search"
+SHOPEE_SHOP_DETAILS_URL = "https://shopee.co.id/shop/{shop_id}/details"
 SHOPEE_PROFILE_URL = "https://shopee.co.id/api/v4/account/get_profile"
+
+# ── Regex for __NEXT_DATA__ extraction ────────────────────────────────────
+_NEXT_DATA_RE = re.compile(
+    r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.DOTALL
+)
 
 # ── Custom exceptions ─────────────────────────────────────────────────────
 
@@ -74,16 +83,17 @@ class CaptchaRequired(Exception):
 @dataclass(slots=True)
 class ShopeeItem:
     """
-    A single product listing returned by the Shopee search API.
+    A single product listing returned by Shopee search.
 
     Attributes:
-        item_id:  Shopee item identifier.
-        shop_id:  Shopee shop identifier.
-        name:     Product name / title.
-        price:    Price in IDR (integer, e.g. 15000 means Rp 15.000).
-        stock:    Available stock count.
-        location: City / warehouse location string.
-        url:      Direct Shopee product URL.
+        item_id:    Shopee item identifier.
+        shop_id:    Shopee shop identifier.
+        name:       Product name / title.
+        price:      Price in IDR (integer, e.g. 15000 means Rp 15.000).
+        stock:      Available stock count.
+        location:   City / warehouse location string.
+        shop_name:  Shop display name.
+        url:        Direct Shopee product URL.
     """
 
     item_id: int
@@ -92,6 +102,7 @@ class ShopeeItem:
     price: int
     stock: int
     location: str
+    shop_name: str
     url: str
 
     @property
@@ -106,26 +117,13 @@ _CSRFTOKEN_RE = re.compile(r"(?:^|;)\s*csrftoken=([^;]+)")
 
 
 def _extract_csrftoken(cookie: str) -> str:
-    """
-    Extract the ``csrftoken`` value from a raw Cookie header string.
-
-    Returns an empty string when the token is absent so callers can still
-    include the ``x-csrftoken`` header (Shopee ignores an empty value less
-    aggressively than a missing header).
-    """
+    """Extract the ``csrftoken`` value from a raw Cookie header string."""
     m = _CSRFTOKEN_RE.search(cookie)
     return m.group(1).strip() if m else ""
 
 
 def _normalize_cookie(cookie: str, risktoken: str | None) -> str:
-    """
-    Ensure the cookie string contains a ``RiskSessionID`` field.
-
-    Some Shopee endpoints expect the risktoken to appear both in the
-    ``x-sz-secsdk-token`` header *and* in the Cookie header as
-    ``RiskSessionID``.  If ``risktoken`` is provided and the field is not
-    already present, it is appended.
-    """
+    """Ensure the cookie string contains a ``RiskSessionID`` field."""
     if not risktoken:
         return cookie
     if "RiskSessionID=" in cookie:
@@ -135,36 +133,56 @@ def _normalize_cookie(cookie: str, risktoken: str | None) -> str:
 
 
 def _safe_str(s: Any) -> str:
-    """
-    Convert *s* to a str and strip lone UTF-16 surrogates.
-
-    Python's ``str.encode('utf-8')`` raises ``UnicodeEncodeError`` on lone
-    surrogates (U+D800–U+DFFF).  Encoding with ``'surrogatepass'`` and
-    decoding with ``'replace'`` substitutes them with the replacement character
-    so that Telegram's bot API never receives malformed UTF-8.
-    """
+    """Convert *s* to str and strip lone UTF-16 surrogates."""
     text = str(s) if not isinstance(s, str) else s
     return text.encode("utf-8", errors="surrogatepass").decode("utf-8", errors="replace")
 
 
 def _build_client() -> httpx.AsyncClient:
-    """
-    Construct a shared :class:`httpx.AsyncClient` with anti-bot-friendly settings.
-
-    Key choices:
-    * ``http2=False`` — HTTP/2 fingerprinting is a known bot signal; staying
-      on HTTP/1.1 matches a common residential Chrome profile.
-    * ``follow_redirects=False`` — unexpected redirects should surface as errors.
-    * Proxy forwarded from ``settings.proxy_url`` when set.
-    """
+    """Construct a shared httpx.AsyncClient with anti-bot-friendly settings."""
     proxy: str | None = settings.proxy_url or None
     return httpx.AsyncClient(
         timeout=settings.request_timeout,
         http2=False,
-        follow_redirects=False,
+        follow_redirects=True,
         proxy=proxy,  # type: ignore[arg-type]
         headers={"User-Agent": settings.user_agent},
     )
+
+
+def _build_html_headers(
+    cookie: str,
+    csrftoken: str,
+    risktoken: str | None = None,
+    referer: str | None = None,
+) -> dict[str, str]:
+    """
+    Build headers that mimic a real browser fetching an HTML page.
+
+    Uses a subset of search headers but swaps JSON-specific ones for
+    standard HTML Accept headers.
+    """
+    headers = build_search_headers(
+        cookie=cookie,
+        csrftoken=csrftoken,
+        risktoken=risktoken,
+        referer=referer or "https://shopee.co.id/",
+    )
+
+    # Override Accept to look like a standard page navigation
+    headers["Accept"] = (
+        "text/html,application/xhtml+xml,application/xml;"
+        "q=0.9,image/avif,image/webp,*/*;q=0.8"
+    )
+    headers["Upgrade-Insecure-Requests"] = "1"
+
+    # Remove JSON-specific headers that would not appear in a page fetch
+    headers.pop("Content-Type", None)
+    headers.pop("content-type", None)
+    headers.pop("X-Requested-With", None)
+    headers.pop("x-requested-with", None)
+
+    return headers
 
 
 async def _request_with_retry(
@@ -174,7 +192,8 @@ async def _request_with_retry(
     headers: dict[str, str],
     params: dict[str, Any] | None = None,
     json_body: dict[str, Any] | None = None,
-) -> tuple[int, dict, dict]:
+    raw_response: bool = False,
+) -> tuple[int, dict | str, dict]:
     """
     Execute an HTTP request with bounded exponential-backoff retry.
 
@@ -182,18 +201,17 @@ async def _request_with_retry(
     * ``httpx.TransportError`` / ``httpx.TimeoutException`` (network layer).
     * HTTP 429 (rate-limited).
 
-    Non-retriable responses are returned immediately regardless of status.
-
     Args:
-        method:    HTTP method string (``"GET"`` or ``"POST"``).
-        url:       Full request URL.
-        headers:   Request headers dict.
-        params:    Optional query parameters.
-        json_body: Optional JSON-serialisable request body.
+        method:       HTTP method string.
+        url:          Full request URL.
+        headers:      Request headers dict.
+        params:       Optional query parameters.
+        json_body:    Optional JSON-serialisable request body.
+        raw_response: If True, return response text instead of parsed JSON.
 
     Returns:
-        A 3-tuple ``(status_code, body_dict, response_headers_dict)``.
-        ``body_dict`` is empty when the response body is not valid JSON.
+        A 3-tuple ``(status_code, body, response_headers_dict)``.
+        ``body`` is a dict (JSON) or str (HTML) depending on ``raw_response``.
     """
     last_exc: Exception | None = None
 
@@ -211,10 +229,13 @@ async def _request_with_retry(
             status = response.status_code
             resp_headers: dict = dict(response.headers)
 
-            try:
-                body: dict = response.json()
-            except Exception:
-                body = {}
+            if raw_response:
+                body: dict | str = response.text
+            else:
+                try:
+                    body = response.json()
+                except Exception:
+                    body = {}
 
             logger.debug(
                 "_request_with_retry attempt=%d url=%s status=%d",
@@ -273,13 +294,6 @@ def _classify_response(status: int, body: dict) -> None:
     403 + is_login == True                        → AntiBotBlocked
     429                                           → RateLimited
     other                                         → AntiBotBlocked
-
-    Args:
-        status: HTTP response status code.
-        body:   Parsed JSON response body (may be empty dict).
-
-    Raises:
-        SessionExpired, AntiBotBlocked, RateLimited, CaptchaRequired
     """
     error_code: int = body.get("error", 0)
     error_msg: str = str(body.get("error_msg") or body.get("message") or "").lower()
@@ -287,7 +301,7 @@ def _classify_response(status: int, body: dict) -> None:
 
     if status == 200:
         if error_code == 0:
-            return  # success
+            return
 
         captcha_codes = {4, 40001, 40002}
         if error_code in captcha_codes or "captcha" in error_msg:
@@ -320,6 +334,109 @@ def _classify_response(status: int, body: dict) -> None:
     raise AntiBotBlocked(
         f"Unexpected HTTP {status} — treating as anti-bot block"
     )
+
+
+def _classify_html_response(status: int, html: str) -> None:
+    """
+    Classify an HTML page response for common error signals.
+
+    For HTML scraping responses we cannot parse Shopee JSON error codes,
+    but we can detect common HTTP-level issues.
+    """
+    if status == 200:
+        return
+
+    if status == 401:
+        raise SessionExpired("HTTP 401 — cookie invalidated")
+
+    if status == 403:
+        lower_html = html[:2000].lower() if html else ""
+        if "captcha" in lower_html or "verify" in lower_html:
+            raise CaptchaRequired(f"HTTP 403 with captcha/verify in response")
+        raise AntiBotBlocked(f"HTTP 403 — anti-bot block on page fetch")
+
+    if status == 429:
+        raise RateLimited("HTTP 429 — rate limited")
+
+    if 300 <= status < 400:
+        # Redirects might indicate session issues
+        raise AntiBotBlocked(f"HTTP {status} redirect — possible anti-bot")
+
+    raise AntiBotBlocked(f"Unexpected HTTP {status} on page fetch")
+
+
+def _parse_next_data(html: str) -> dict | None:
+    """
+    Extract and parse the __NEXT_DATA__ JSON blob from Shopee HTML.
+
+    Returns the parsed dict, or None if not found.
+    """
+    match = _NEXT_DATA_RE.search(html)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(1))
+    except (json.JSONDecodeError, ValueError) as exc:
+        logger.warning("Failed to parse __NEXT_DATA__ JSON: %s", exc)
+        return None
+
+
+def _normalize_item(raw: dict) -> ShopeeItem | None:
+    """
+    Convert a raw item dict (from __NEXT_DATA__) into a ShopeeItem.
+
+    The HTML-embedded structure may nest fields under ``item_basic`` or
+    expose them directly. This function handles both cases.
+    """
+    try:
+        # Try item_basic sub-object first (common in __NEXT_DATA__)
+        item_data = raw.get("item_basic") or raw
+
+        item_id: int = int(item_data.get("itemid") or item_data.get("item_id") or 0)
+        shop_id: int = int(item_data.get("shopid") or item_data.get("shop_id") or 0)
+
+        if not item_id or not shop_id:
+            logger.debug(
+                "_normalize_item: missing item_id or shop_id in %r",
+                list(item_data.keys())[:10],
+            )
+            return None
+
+        name: str = _safe_str(item_data.get("name") or item_data.get("title") or "")
+        raw_price: int = int(item_data.get("price") or item_data.get("price_min") or 0)
+        # Shopee encodes price as IDR * 100_000
+        price: int = raw_price // 100_000 if raw_price > 100_000 else raw_price
+
+        stock: int = int(item_data.get("stock") or item_data.get("total_stock") or 0)
+
+        # Location: may be a string or a nested dict
+        loc_obj = item_data.get("shop_location") or item_data.get("item_location") or ""
+        if isinstance(loc_obj, dict):
+            location: str = _safe_str(loc_obj.get("city") or loc_obj.get("region") or "")
+        else:
+            location = _safe_str(loc_obj)
+
+        shop_name: str = _safe_str(
+            item_data.get("shop_name")
+            or raw.get("shop_name")
+            or ""
+        )
+
+        url = f"https://shopee.co.id/product/{shop_id}/{item_id}"
+
+        return ShopeeItem(
+            item_id=item_id,
+            shop_id=shop_id,
+            name=name,
+            price=price,
+            stock=stock,
+            location=location,
+            shop_name=shop_name,
+            url=url,
+        )
+    except (TypeError, ValueError) as exc:
+        logger.debug("_normalize_item failed: %s — raw keys: %s", exc, list(raw.keys())[:10])
+        return None
 
 
 # ── Public API ──────────────────────────────────────────────────────────
@@ -368,7 +485,6 @@ async def validate_session(
 
     logger.debug("validate_session status=%d error=%s", status, body.get("error"))
 
-    # ── Captcha check ─────────────────────────────────────────────────────────
     error_code: int = body.get("error", 0)
     error_msg: str = str(body.get("error_msg") or body.get("message") or "").lower()
     captcha_codes = {4, 40001, 40002}
@@ -381,7 +497,6 @@ async def validate_session(
             "reason": f"Shopee demands captcha (error={error_code})",
         }
 
-    # ── Session-expired signals ─────────────────────────────────────────────
     if status == 401 or (status == 403 and body.get("is_login") is False):
         return {
             "valid": False,
@@ -391,7 +506,6 @@ async def validate_session(
             "reason": f"Session expired (HTTP {status})",
         }
 
-    # ── Anti-bot without session invalidation ───────────────────────────────
     if status == 403 or (status == 200 and error_code == 90309999):
         return {
             "valid": False,
@@ -401,7 +515,6 @@ async def validate_session(
             "reason": f"Anti-bot block (HTTP {status}, error={error_code})",
         }
 
-    # ── Success ─────────────────────────────────────────────────────────────
     if status == 200 and error_code == 0:
         profile: dict = (body.get("data") or {}).get("user_profile") or {}
         if not profile:
@@ -421,7 +534,6 @@ async def validate_session(
             "reason": None,
         }
 
-    # ── Unknown response ──────────────────────────────────────────────────────
     return {
         "valid": False,
         "username": None,
@@ -431,83 +543,6 @@ async def validate_session(
     }
 
 
-def _extract_items(body: dict) -> list:
-    """
-    Try multiple response shapes to locate the item list.
-
-    Shopee's API response envelope has changed across versions.  We probe
-    the most common structures in priority order.
-
-    Args:
-        body: Parsed JSON response body.
-
-    Returns:
-        A list of raw item dicts, possibly empty.
-    """
-    candidates = [
-        (body.get("data") or {}).get("items"),
-        body.get("items"),
-        (body.get("result") or {}).get("items"),
-        (body.get("result") or {}).get("item"),
-    ]
-    for candidate in candidates:
-        if isinstance(candidate, list):
-            return candidate
-    return []
-
-
-def _normalize_item(raw: dict) -> ShopeeItem | None:
-    """
-    Convert a raw Shopee item dict into a :class:`ShopeeItem`.
-
-    Handles multiple field-name variants across different API versions.
-    Price is stored by Shopee as (IDR × 100 000); values above 100 000 are
-    divided to recover the IDR amount.
-
-    Args:
-        raw: A single raw item dict from the Shopee API.
-
-    Returns:
-        A :class:`ShopeeItem` on success, or ``None`` when required fields
-        are absent / unparseable.
-    """
-    try:
-        item_id: int = int(raw.get("itemid") or raw.get("item_id") or 0)
-        shop_id: int = int(raw.get("shopid") or raw.get("shop_id") or 0)
-
-        if not item_id or not shop_id:
-            logger.debug("_normalize_item: missing item_id or shop_id in %r", list(raw.keys()))
-            return None
-
-        name: str = _safe_str(raw.get("name") or raw.get("title") or "")
-        raw_price: int = int(raw.get("price") or raw.get("price_min") or 0)
-        # Shopee encodes price as IDR * 100_000
-        price: int = raw_price // 100_000 if raw_price > 100_000 else raw_price
-
-        stock: int = int(raw.get("stock") or raw.get("total_stock") or 0)
-
-        loc_obj: dict = raw.get("shop_location") or raw.get("warehouse_location") or {}
-        if isinstance(loc_obj, dict):
-            location: str = _safe_str(loc_obj.get("city") or loc_obj.get("region") or "")
-        else:
-            location = _safe_str(loc_obj)
-
-        url = f"https://shopee.co.id/product/{shop_id}/{item_id}"
-
-        return ShopeeItem(
-            item_id=item_id,
-            shop_id=shop_id,
-            name=name,
-            price=price,
-            stock=stock,
-            location=location,
-            url=url,
-        )
-    except (TypeError, ValueError) as exc:
-        logger.debug("_normalize_item failed: %s — raw keys: %s", exc, list(raw.keys()))
-        return None
-
-
 async def search_items(
     *,
     cookie: str,
@@ -515,16 +550,23 @@ async def search_items(
     risktoken: str | None = None,
     newest: int = 0,
     limit: int = 30,
+    fe_filter_options: list[dict[str, Any]] | None = None,
 ) -> list[ShopeeItem]:
     """
-    Search Shopee for items matching *keyword* and return parsed results.
+    Search Shopee for items matching *keyword* via HTML page scraping.
+
+    Fetches the search results page as HTML, parses the embedded
+    ``__NEXT_DATA__`` JSON, and extracts product items from it.
 
     Args:
-        cookie:    Raw browser cookie string.
-        keyword:   Search keyword.
-        risktoken: Optional SECSDK token for anti-bot bypass.
-        newest:    Pagination offset (0-based).
-        limit:     Maximum number of results to return.
+        cookie:             Raw browser cookie string.
+        keyword:            Search keyword.
+        risktoken:          Optional SECSDK token for anti-bot bypass.
+        newest:             Pagination offset (0-based).
+        limit:              Maximum number of results to return.
+        fe_filter_options:  Optional filter list for location/shop type.
+            Example: [{"group_name":"SHOP_TYPE","values":["OFFICIAL_MALL"]},
+                      {"group_name":"LOCATIONS","values":["Jabodetabek"]}]
 
     Returns:
         A list of :class:`ShopeeItem` objects (may be empty).
@@ -537,50 +579,209 @@ async def search_items(
     encoded_kw = urllib.parse.quote(keyword)
     referer = f"https://shopee.co.id/search?keyword={encoded_kw}"
 
-    headers = build_search_headers(
+    headers = _build_html_headers(
         cookie=norm_cookie,
         csrftoken=csrftoken,
         risktoken=risktoken,
         referer=referer,
     )
 
+    # Build query parameters
     params: dict[str, Any] = {
         "keyword": keyword,
         "limit": limit,
-        "newest": newest,
-        "order": "asc",
-        "page_type": "search",
-        "scenario": "PAGE_GLOBAL_SEARCH",
-        "version": "2",
-        "by": "relevancy",
-        "match_id": 0,
-        "src": "search",
-        "fs_only": 0,
+        "offset": newest,
     }
 
-    status, body, _ = await _request_with_retry(
+    if fe_filter_options:
+        params["fe_filter_options"] = json.dumps(fe_filter_options, separators=(",", ":"))
+
+    # Fetch HTML page
+    status, html, _ = await _request_with_retry(
         "GET",
-        SHOPEE_SEARCH_URL,
+        SHOPEE_SEARCH_PAGE_URL,
         headers=headers,
         params=params,
+        raw_response=True,
     )
 
-    _classify_response(status, body)
+    # Classify HTTP-level errors
+    _classify_html_response(status, html)  # type: ignore[arg-type]
 
-    raw_items = _extract_items(body)
+    # Parse __NEXT_DATA__ from the HTML
+    next_data = _parse_next_data(html)  # type: ignore[arg-type]
+
+    if next_data is None:
+        logger.warning(
+            "search_items keyword=%r: __NEXT_DATA__ not found in HTML response "
+            "(len=%d). Shopee may not be SSR-ing search results.",
+            keyword,
+            len(html) if html else 0,
+        )
+        return []
+
+    # Navigate the JSON to find items — try multiple paths
+    page_props = next_data.get("props", {}).get("pageProps", {}) or {}
+
+    raw_items: list = (
+        page_props.get("initialSearchResult", {}).get("items")
+        or page_props.get("searchResult", {}).get("items")
+        or page_props.get("data", {}).get("items")
+        or []
+    )
+
+    if not raw_items:
+        # Try deeper nested paths
+        dehydrated = next_data.get("props", {}).get("dehydratedState", {})
+        queries = dehydrated.get("queries", []) if isinstance(dehydrated, dict) else []
+        for query in queries:
+            state_data = (query.get("state", {}).get("data") or {})
+            if isinstance(state_data, dict):
+                candidate = state_data.get("items") or state_data.get("data", {}).get("items")
+                if isinstance(candidate, list) and candidate:
+                    raw_items = candidate
+                    break
+
+    if not raw_items:
+        logger.warning(
+            "search_items keyword=%r: __NEXT_DATA__ found but no items in known paths. "
+            "Available pageProps keys: %s",
+            keyword,
+            list(page_props.keys())[:15],
+        )
+        return []
+
+    # Normalize items
     items: list[ShopeeItem] = []
     for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
         item = _normalize_item(raw)
         if item is not None:
             items.append(item)
 
     logger.info(
-        "search_items keyword=%r returned %d/%d parsed items",
+        "search_items keyword=%r returned %d/%d parsed items (via __NEXT_DATA__)",
         keyword,
         len(items),
         len(raw_items),
     )
     return items
+
+
+async def get_shop_info(
+    shop_id: int,
+    cookie: str,
+    risktoken: str | None = None,
+) -> dict | None:
+    """
+    Fetch shop details from Shopee's shop details page.
+
+    Parses the ``__NEXT_DATA__`` JSON embedded in the HTML of
+    ``https://shopee.co.id/shop/{shop_id}/details``.
+
+    Args:
+        shop_id:   Shopee shop identifier.
+        cookie:    Raw browser cookie string.
+        risktoken: Optional SECSDK token for anti-bot bypass.
+
+    Returns:
+        A dict with keys: shop_name, username, is_official_shop,
+        follower_count, rating. Returns None if info cannot be extracted.
+    """
+    norm_cookie = _normalize_cookie(cookie, risktoken)
+    csrftoken = _extract_csrftoken(norm_cookie)
+
+    url = SHOPEE_SHOP_DETAILS_URL.format(shop_id=shop_id)
+    params = {"shopid": shop_id}
+
+    headers = _build_html_headers(
+        cookie=norm_cookie,
+        csrftoken=csrftoken,
+        risktoken=risktoken,
+        referer=f"https://shopee.co.id/shop/{shop_id}",
+    )
+
+    try:
+        status, html, _ = await _request_with_retry(
+            "GET",
+            url,
+            headers=headers,
+            params=params,
+            raw_response=True,
+        )
+    except (httpx.TransportError, httpx.TimeoutException, RateLimited) as exc:
+        logger.warning("get_shop_info shop_id=%d network/rate error: %s", shop_id, exc)
+        return None
+
+    if status != 200:
+        logger.warning("get_shop_info shop_id=%d got HTTP %d", shop_id, status)
+        return None
+
+    next_data = _parse_next_data(html)  # type: ignore[arg-type]
+    if next_data is None:
+        logger.warning(
+            "get_shop_info shop_id=%d: __NEXT_DATA__ not found in HTML", shop_id
+        )
+        return None
+
+    # Navigate to shop info — try multiple paths
+    page_props = next_data.get("props", {}).get("pageProps", {}) or {}
+
+    shop_data: dict = (
+        page_props.get("shopDetail")
+        or page_props.get("shop")
+        or page_props.get("data", {}).get("shopDetail")
+        or page_props.get("data", {}).get("shop")
+        or {}
+    )
+
+    if not shop_data:
+        # Try dehydratedState queries
+        dehydrated = next_data.get("props", {}).get("dehydratedState", {})
+        queries = dehydrated.get("queries", []) if isinstance(dehydrated, dict) else []
+        for query in queries:
+            state_data = query.get("state", {}).get("data") or {}
+            if isinstance(state_data, dict):
+                candidate = (
+                    state_data.get("shopDetail")
+                    or state_data.get("shop")
+                    or state_data.get("data")
+                )
+                if isinstance(candidate, dict) and candidate.get("shopid"):
+                    shop_data = candidate
+                    break
+
+    if not shop_data:
+        logger.warning(
+            "get_shop_info shop_id=%d: no shop data found in __NEXT_DATA__. "
+            "Available pageProps keys: %s",
+            shop_id,
+            list(page_props.keys())[:15],
+        )
+        return None
+
+    return {
+        "shop_name": _safe_str(
+            shop_data.get("shop_name") or shop_data.get("name") or ""
+        ),
+        "username": _safe_str(
+            shop_data.get("username") or shop_data.get("account", {}).get("username") or ""
+        ),
+        "is_official_shop": bool(
+            shop_data.get("is_official_shop")
+            or shop_data.get("is_preferred_plus_seller")
+        ),
+        "follower_count": int(
+            shop_data.get("follower_count") or shop_data.get("follower") or 0
+        ),
+        "rating": float(
+            shop_data.get("rating_star")
+            or shop_data.get("rating")
+            or shop_data.get("shop_rating", {}).get("rating_star")
+            or 0.0
+        ),
+    }
 
 
 def parse_risktoken_input(text: str) -> RiskToken | None:
