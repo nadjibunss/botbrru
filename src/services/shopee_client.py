@@ -27,7 +27,7 @@ from typing import Any
 import httpx
 
 from src.config import settings
-from src.services.fingerprint import RiskToken, parse_risktoken
+from src.utils.fingerprint import RiskToken, parse_risktoken
 from src.utils.headers import build_profile_headers, build_search_headers
 
 logger = logging.getLogger(__name__)

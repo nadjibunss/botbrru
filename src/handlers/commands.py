@@ -1,6 +1,7 @@
 """Telegram command handlers and setup state machine."""
 from __future__ import annotations
 
+import copy
 import html
 import json
 import logging
@@ -95,7 +96,7 @@ async def ensure_user(
                 user["telegram_username"] = telegram_username
             return user
 
-        document = DEFAULT_USER_DOC.copy()
+        document = copy.deepcopy(DEFAULT_USER_DOC)
         document.update(
             {
                 "telegram_id": telegram_id,
@@ -460,7 +461,7 @@ def is_token_shape_valid(token: str) -> bool:
     return (
         bool(separator)
         and left.isdigit()
-        and 8 <= len(left) <= 11
+        and 8 <= len(left) <= 16
         and len(right) >= 30
     )
 
@@ -604,7 +605,18 @@ async def command_start_monitor(
         return
 
     await send_message(chat_id, "\ud83d\udd0d Memeriksa sesi Shopee...")
-    session = await validate_cookie(cookie)
+
+    # Sertakan risktoken tersimpan (bila ada) agar pre-check konsisten
+    # dengan yang dipakai worker saat monitoring.
+    risktoken = None
+    risktoken_enc = user.get("risktoken_enc")
+    if risktoken_enc:
+        try:
+            risktoken = decrypt(risktoken_enc)
+        except ValueError:
+            risktoken = None
+
+    session = await validate_cookie(cookie, risktoken=risktoken)
 
     if not session.valid:
         await send_message(

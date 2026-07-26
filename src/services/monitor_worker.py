@@ -23,6 +23,12 @@ _workers: dict[int, asyncio.Task] = {}
 
 SHOPEE_SEARCH_URL = "https://shopee.co.id/api/v4/search/search_items"
 
+# Maximum number of already-notified item ids kept per user. Prevents the
+# MongoDB document from growing unbounded (16MB cap) and keeps membership
+# checks fast. Oldest ids are evicted first; an evicted item that comes back
+# in stock may notify again — an acceptable trade-off for a large cap.
+MAX_CHECKED_ITEMS = 2000
+
 
 class SessionExpiredError(Exception):
     """Raised when Shopee returns genuine session-expired (401 or is_login=false)."""
@@ -41,6 +47,19 @@ def _extract_csrftoken(cookie: str) -> str:
         if part.startswith("csrftoken="):
             return part.split("=", 1)[1]
     return ""
+
+
+def _extract_item_fields(item: dict) -> tuple[int | None, int | None, dict]:
+    """Return (item_id, shop_id, item_basic) from a Shopee search result entry.
+
+    Shopee nests the core product fields under ``item_basic``; some API
+    versions also mirror ``itemid``/``shopid`` at the top level. Read the
+    top level first, then fall back to ``item_basic`` so both shapes work.
+    """
+    item_basic = item.get("item_basic") or item
+    item_id = item.get("itemid") or item_basic.get("itemid")
+    shop_id = item.get("shopid") or item_basic.get("shopid")
+    return item_id, shop_id, item_basic
 
 
 async def start_worker(telegram_id: int) -> bool:
@@ -134,6 +153,7 @@ async def _monitor_loop(telegram_id: int) -> None:
             keywords_raw = user.get("keywords") or settings.default_keywords
             keywords = [kw.strip() for kw in keywords_raw.split("|") if kw.strip()]
             checked_items: list = user.get("checked_items") or []
+            checked_set: set = set(checked_items)  # O(1) membership lookups
             new_checked_items: list = list(checked_items)
 
             # Tentukan target chat (group atau private)
@@ -180,15 +200,18 @@ async def _monitor_loop(telegram_id: int) -> None:
                     continue
 
                 for item in items:
-                    item_id = item.get("itemid")
-                    shop_id = item.get("shopid")
-                    item_basic = item.get("item_basic") or item
+                    item_id, shop_id, item_basic = _extract_item_fields(item)
+
+                    # Lewati entri tanpa id valid (mencegah link rusak &
+                    # None mencemari checked_items)
+                    if not item_id or not shop_id:
+                        continue
 
                     stock = item_basic.get("stock", 0)
                     if stock <= 0:
                         continue
 
-                    if item_id in checked_items:
+                    if item_id in checked_set:
                         continue
 
                     # Item baru dengan stok tersedia
@@ -210,6 +233,7 @@ async def _monitor_loop(telegram_id: int) -> None:
 
                     await send_message(target_chat, notification, token=bot_token)
                     new_checked_items.append(item_id)
+                    checked_set.add(item_id)
 
                 # Sleep antar keyword
                 await asyncio.sleep(
@@ -219,7 +243,11 @@ async def _monitor_loop(telegram_id: int) -> None:
                     )
                 )
 
-            # Update checked_items di DB
+            # Update checked_items di DB (batasi ke N terakhir agar dokumen
+            # tidak tumbuh tanpa batas)
+            if len(new_checked_items) > MAX_CHECKED_ITEMS:
+                new_checked_items = new_checked_items[-MAX_CHECKED_ITEMS:]
+
             if new_checked_items != checked_items:
                 await db.users.update_one(
                     {"telegram_id": telegram_id},

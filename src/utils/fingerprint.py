@@ -1,5 +1,5 @@
 """
-src/services/fingerprint.py
+src/utils/fingerprint.py
 Manages Shopee risktoken / SECSDK handling.
 
 Shopee's SECSDK is a heavily obfuscated JavaScript library that generates a
