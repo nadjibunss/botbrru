@@ -7,13 +7,15 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from src.config import settings
 from src.handlers.commands import handle_update
 from src.services.monitor_worker import start_worker
 from src.utils.database import close_db, get_db
 from src.utils.telegram import delete_webhook, get_updates
 
 logging.basicConfig(
-    level=logging.INFO,
+    # LOG_LEVEL di .env: INFO (default) atau DEBUG untuk diagnosa lebih detail
+    level=getattr(logging, settings.log_level.upper(), logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 

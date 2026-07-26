@@ -12,6 +12,14 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://api.telegram.org/bot{token}"
 
 
+class TelegramAPIError(Exception):
+    """Raised when the Telegram Bot API returns a non-ok response.
+
+    Lets the polling loop back off (sleep) instead of hammering the API
+    in a tight loop when the token is invalid or Telegram is unavailable.
+    """
+
+
 def _url(token: str, method: str) -> str:
     return f"{BASE_URL.format(token=token)}/{method}"
 
@@ -120,6 +128,8 @@ async def get_updates(offset: int, timeout: int = 30) -> list[dict]:
     )
 
     if not data.get("ok"):
-        return []
+        # Signal the failure so polling_loop sleeps before retrying,
+        # rather than spinning in a tight loop against the API.
+        raise TelegramAPIError("getUpdates returned a non-ok response")
 
     return data.get("result", [])
