@@ -101,6 +101,40 @@ docker compose up --build -d # setelah update kode
 
 ---
 
+## A-proxy. Proxy untuk melawan anti-bot (403 / kode 90309999)
+
+Kalau pencarian Shopee balas `403` / `Anti-bot block ... 90309999`, artinya IP
+kamu (sering IP VPS) diblokir. Bot ini bisa memakai **daftar proxy** dan
+merotasinya otomatis untuk request pencarian.
+
+1. Isi file `proxies.txt` di folder proyek — satu proxy per baris:
+   ```
+   http://ip:port
+   socks5://ip:port
+   http://user:pass@ip:port
+   ```
+   Baris kosong / diawali `#` diabaikan. (File contoh sudah disertakan.)
+2. `docker-compose.yml` sudah mem-*mount* `proxies.txt` ke `/app/proxies.txt`
+   dan menyetel `PROXY_FILE=/app/proxies.txt`. Cukup edit isinya lalu:
+   ```bash
+   docker compose restart app
+   ```
+3. Cek jumlah proxy yang termuat lewat `/status` (baris **Proxy**), atau di log:
+   `Loaded N proxies from /app/proxies.txt`.
+
+Cara kerja: tiap pencarian mengambil satu proxy acak. Bila proxy mati atau
+kena 403, proxy itu diparkir sementara (cooldown) dan bot mencoba proxy lain
+(sampai `PROXY_MAX_TRIES`, default 4). Bila `proxies.txt` kosong/tak ada, bot
+jalan langsung tanpa proxy (perilaku lama).
+
+> Realistis: proxy **publik/gratis** umumnya sudah mati atau ikut diblokir
+> Shopee, jadi peluang lolosnya kecil. Yang benar-benar bekerja biasanya
+> proxy **residential/mobile**. Kalau proxy saja belum cukup, langkah
+> berikutnya adalah menyamakan TLS fingerprint (mis. `curl_cffi`
+> `impersonate="chrome124"`) — bisa ditambahkan menyusul.
+
+---
+
 ## B. Cara ambil log (agar bisa diperbaiki dari log)
 
 ### B1. Naikkan detail log saat ada masalah

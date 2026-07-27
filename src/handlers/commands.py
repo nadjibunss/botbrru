@@ -10,6 +10,7 @@ from src.config import settings
 from src.models.user import DEFAULT_USER_DOC
 from src.services.monitor_worker import (
     is_worker_running,
+    proxy_pool_size,
     start_worker,
     stop_worker,
 )
@@ -470,16 +471,21 @@ async def command_start(chat_id: int) -> None:
     """Send bot help."""
     text = (
         "\ud83e\udd16 <b>Shopee Instant Stock Monitor</b>\n\n"
-        "<b>Setup aman:</b>\n"
-        "1. /setcredentials \u2192 kirim cookie sesi\n"
-        "2. /setfingerprint &lt;JSON&gt; (opsional)\n"
-        "3. /setbot &lt;token&gt; (opsional, silent)\n"
-        "4. /setgroup &lt;chat_id&gt; (opsional)\n"
+        "<b>Setup (lewat private chat):</b>\n"
+        "1. /setcredentials \u2192 kirim cookie sesi Shopee\n"
+        "2. /setfingerprint &lt;risktoken&gt; \u2192 opsional, agar lolos anti-bot\n"
+        "   (atau /skip saat diminta risktoken)\n"
+        "3. /setbot &lt;token&gt; \u2192 opsional, notif lewat bot sendiri (silent)\n"
+        "4. /setgroup &lt;chat_id&gt; \u2192 opsional, kirim notif ke grup\n"
         "5. /setkeywords kata1 | kata2 | kata3\n"
-        "6. /setarea Kab. Bekasi\n"
-        "7. /start_monitor\n\n"
-        "Bot <b>tidak</b> menyimpan password atau OTP.\n"
-        "/cancel membatalkan setup aktif."
+        "6. /setarea &lt;nama&gt; \u2192 opsional, catatan area (belum memfilter hasil)\n"
+        "7. /start_monitor \u2192 mulai memantau\n\n"
+        "<b>Kontrol:</b>\n"
+        "/status \u2192 lihat status &amp; konfigurasi\n"
+        "/stop_monitor \u2192 berhenti memantau\n"
+        "/reset \u2192 kosongkan daftar item yang sudah dicek\n"
+        "/cancel \u2192 batalkan setup yang sedang berjalan\n\n"
+        "Bot <b>tidak</b> menyimpan password atau OTP."
     )
     await send_message(chat_id, text)
 
@@ -681,6 +687,9 @@ async def command_status(
     else:
         phone_status = "\u2796"
 
+    n_proxies = proxy_pool_size()
+    proxy_status = f"\ud83c\udf10 {n_proxies} proxy" if n_proxies else "\u2796 langsung (tanpa proxy)"
+
     status_icon = "\ud83d\udfe2" if active else "\ud83d\udd34"
     status_text = "Aktif" if active else "Tidak aktif"
     text = (
@@ -691,6 +700,7 @@ async def command_status(
         f"<b>Cookie:</b> {cookie_status}\n"
         f"<b>Custom bot:</b> {bot_status}\n"
         f"<b>Group:</b> {group_status}\n"
+        f"<b>Proxy:</b> {proxy_status}\n"
         f"<b>Area:</b> {area}\n"
         f"<b>Keywords:</b> {keywords}"
     )
