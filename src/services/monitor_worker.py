@@ -15,6 +15,7 @@ import httpx
 from src.config import settings
 from src.utils.crypto import decrypt
 from src.utils.database import get_db
+from src.utils.proxy import ProxyPool, load_proxies, mask
 from src.utils.telegram import send_message
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,28 @@ SHOPEE_SEARCH_URL = "https://shopee.co.id/api/v4/search/search_items"
 # checks fast. Oldest ids are evicted first; an evicted item that comes back
 # in stock may notify again — an acceptable trade-off for a large cap.
 MAX_CHECKED_ITEMS = 2000
+
+# Shared proxy pool, built lazily from settings on first search.
+_proxy_pool: ProxyPool | None = None
+
+
+def _get_proxy_pool() -> ProxyPool:
+    """Build (once) and return the shared proxy pool.
+
+    Priority: PROXY_FILE (rotating list) → PROXY_URL (single) → empty (direct).
+    """
+    global _proxy_pool
+    if _proxy_pool is None:
+        proxies = load_proxies(settings.proxy_file)
+        if not proxies and settings.proxy_url:
+            proxies = [settings.proxy_url]
+        _proxy_pool = ProxyPool(proxies, cooldown=settings.proxy_cooldown)
+    return _proxy_pool
+
+
+def proxy_pool_size() -> int:
+    """Number of proxies currently loaded (surfaced by /status)."""
+    return len(_get_proxy_pool())
 
 
 class SessionExpiredError(Exception):
@@ -330,67 +353,99 @@ async def _search_shopee(cookie: str, keyword: str, risktoken: str | None = None
     if risktoken:
         headers["x-sz-secsdk-token"] = risktoken
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.get(
-            SHOPEE_SEARCH_URL,
-            params=params,
-            headers=headers,
+    # --- Request with proxy rotation + anti-bot classification ---
+    # A 403 / in-body anti-bot block means the current IP is flagged, so we
+    # park that proxy and retry through the next one. A genuine session
+    # problem (401 or is_login=false) can't be fixed by another proxy, so it
+    # is raised immediately.
+    pool = _get_proxy_pool()
+    tries = max(1, settings.proxy_max_tries) if not pool.empty else 1
+
+    body: dict | None = None
+    last_error: Exception | None = None
+
+    for attempt in range(1, tries + 1):
+        used_proxy = pool.get()  # None → direct connection
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=30,
+                proxy=used_proxy,
+                follow_redirects=True,
+            ) as client:
+                response = await client.get(
+                    SHOPEE_SEARCH_URL,
+                    params=params,
+                    headers=headers,
+                )
+        except (httpx.TransportError, httpx.TimeoutException, ValueError) as exc:
+            last_error = exc
+            logger.warning(
+                "Shopee search transport or configuration error (attempt %d/%d via %s): %s",
+                attempt, tries, mask(used_proxy), exc,
+            )
+            pool.mark_bad(used_proxy)
+            continue
+
+        if response.status_code == 401:
+            raise SessionExpiredError("HTTP 401 - Unauthorized")
+
+        if response.status_code == 403:
+            try:
+                body_403 = response.json()
+            except Exception:
+                body_403 = {}
+            if isinstance(body_403, dict) and body_403.get("is_login") is False:
+                raise SessionExpiredError("Session tidak valid (is_login=false)")
+            logger.warning(
+                "Shopee search 403 anti-bot (attempt %d/%d via %s)",
+                attempt, tries, mask(used_proxy),
+            )
+            pool.mark_bad(used_proxy)
+            last_error = AntiBotError("HTTP 403 anti-bot")
+            continue
+
+        # Parse the (non-401/403) body.
+        try:
+            parsed = response.json()
+        except Exception:
+            logger.warning(
+                "Non-JSON response from Shopee search: HTTP %s",
+                response.status_code,
+            )
+            pool.mark_good(used_proxy)
+            return []
+
+        # In-body anti-bot / session signals (e.g. error 90309999).
+        error_code = parsed.get("error")
+        error_msg = parsed.get("error_msg") or ""
+        is_login = parsed.get("is_login", True)
+
+        if error_code:
+            if not is_login:
+                raise SessionExpiredError(f"Session expired: {error_msg}")
+            logger.warning(
+                "Shopee search in-body block %s (attempt %d/%d via %s): %s",
+                error_code, attempt, tries, mask(used_proxy), error_msg,
+            )
+            pool.mark_bad(used_proxy)
+            last_error = AntiBotError(f"Shopee error {error_code}: {error_msg}")
+            continue
+
+        pool.mark_good(used_proxy)
+        body = parsed
+        break
+
+    if body is None:
+        if isinstance(last_error, SessionExpiredError):
+            raise last_error
+        scope = "direct" if pool.empty else f"{len(pool)} proxy"
+        raise AntiBotError(
+            f"Pencarian gagal setelah {tries} percobaan ({scope}): {last_error}"
         )
 
-    # --- Error handling: distinguish session-expired vs anti-bot ---
-
-    if response.status_code == 401:
-        raise SessionExpiredError("HTTP 401 - Unauthorized")
-
-    if response.status_code == 403:
-        try:
-            body = response.json()
-        except Exception:
-            # Can't parse body, assume anti-bot (not session expired)
-            raise AntiBotError(f"HTTP 403, non-JSON response")
-
-        is_login = body.get("is_login", True)
-        if not is_login:
-            raise SessionExpiredError("Session tidak valid (is_login=false)")
-        else:
-            error_code = body.get("error") or body.get("error_msg") or ""
-            raise AntiBotError(f"Anti-bot block (403): {error_code}")
-
-    # Parse response body
-    try:
-        body = response.json()
-    except Exception:
-        logger.warning("Non-JSON response from Shopee search: %s", response.status_code)
-        return []
-
-    # Check for error codes in body (e.g. 90309999 = anti-bot)
-    error_code = body.get("error")
-    error_msg = body.get("error_msg") or ""
-
-    if error_code:
-        # Check if it's genuinely unauthorized
-        is_login = body.get("is_login", True)
-
-        if not is_login:
-            raise SessionExpiredError(f"Session expired: {error_msg}")
-
-        # Error code present but is_login=true means anti-bot, not session issue
-        if error_code == 90309999 or "bot" in str(error_msg).lower():
-            raise AntiBotError(f"Anti-bot error {error_code}: {error_msg}")
-
-        # Other errors with is_login=true: treat as anti-bot/transient, not session expired
-        if isinstance(error_code, int) and error_code != 0:
-            raise AntiBotError(f"Shopee error {error_code}: {error_msg}")
-
-        # String error codes that indicate unauthorized
-        if isinstance(error_code, str) and "unauthorized" in error_code.lower():
-            if not is_login:
-                raise SessionExpiredError(error_msg)
-            else:
-                raise AntiBotError(f"Blocked: {error_code}")
-
-    # Parse items - coba kedua struktur response
-    items = []
+    # --- Parse items — coba beberapa struktur response ---
+    items: list = []
 
     # Struktur 1: data.items (newer API)
     if "data" in body and body["data"]:
@@ -398,10 +453,11 @@ async def _search_shopee(cookie: str, keyword: str, risktoken: str | None = None
         if isinstance(data, dict):
             items = data.get("items") or []
 
-    # Struktur 2: result.item (older API) - fallback
+    # Struktur 2: items di root (fallback)
     if not items and "items" in body:
         items = body.get("items") or []
 
+    # Struktur 3: result.items / result.item (older API)
     if not items and "result" in body:
         result = body.get("result")
         if isinstance(result, dict):

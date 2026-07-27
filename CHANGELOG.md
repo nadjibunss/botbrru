@@ -1,5 +1,44 @@
 # Changelog — perbaikan botbrru
 
+## Update: rotasi proxy + audit perintah
+
+Konteks: dari log, token/404 sudah beres dan app jalan; satu-satunya kegagalan
+adalah Shopee membalas `403` anti-bot (kode `90309999`) di endpoint pencarian,
+sedangkan `get_profile` tetap `200` (cookie valid). Itu proteksi anti-scraping
+Shopee, bukan bug. Perubahan berikut menambah senjata proxy dan merapikan
+perintah. Semua file lolos `py_compile`; logika proxy diuji unit
+(`tests/test_proxy.py`, 14/14 PASS). Keberhasilan menembus anti-bot tetap
+bergantung kualitas proxy — perlu diuji di lingkunganmu.
+
+- **Baru `src/utils/proxy.py`** — pool proxy: muat dari file, rotasi acak,
+  parkir proxy yang mati/diblokir (cooldown), sembunyikan kredensial saat log.
+- **`monitor_worker._search_shopee` kini pakai proxy + rotasi.** Sebelumnya
+  request pencarian memakai `httpx` tanpa proxy sama sekali (jadi `PROXY_URL`
+  di `.env` tidak berefek). Sekarang: ambil proxy dari pool, pada `403`/anti-bot
+  parkir proxy itu lalu coba proxy lain (`PROXY_MAX_TRIES`, default 4). `401` /
+  `is_login=false` tetap dianggap sesi habis (proxy tak menolong). Tanpa proxy
+  → jalan langsung seperti semula.
+- **Config**: tambah `PROXY_FILE`, `PROXY_MAX_TRIES`, `PROXY_COOLDOWN`.
+  `requirements.txt`: `httpx` → `httpx[socks]` agar proxy `socks5://` didukung.
+  `docker-compose.yml`: mount `./proxies.txt` → `/app/proxies.txt` + set
+  `PROXY_FILE`. Disertakan `proxies.txt` contoh (gabungan daftar yang dikirim).
+- **Audit perintah Telegram** (deskripsi disesuaikan dengan perilaku nyata):
+  - `/start` dulu menyebut `/setfingerprint <JSON>` — **salah**, argumennya
+    risktoken. Diperbaiki jadi `<risktoken>`.
+  - `/start` dulu tak mencantumkan `/skip`, `/status`, `/stop_monitor`,
+    `/reset`. Kini semua perintah yang benar-benar ada didaftarkan dan
+    dikelompokkan (Setup / Kontrol).
+  - `/setarea` diberi keterangan jujur: **belum memfilter hasil** pencarian
+    (nilai area hanya disimpan/ditampilkan; worker mencari per-keyword saja).
+  - `/status` kini menampilkan jumlah proxy yang termuat.
+  - Diverifikasi: `/setcredentials`, `/skip`, `/setbot`, `/setgroup`,
+    `/setkeywords`, `/start_monitor`, `/stop_monitor`, `/status`, `/reset`,
+    `/cancel` — routing & alur benar.
+
+---
+
+# Changelog lama
+
 Semua perubahan di bawah sudah diverifikasi dengan menjalankan kode
 (kompilasi, analisis statis import/atribut, unit test logika, dan uji
 handler end-to-end memakai MongoDB & Telegram tiruan). Total 118

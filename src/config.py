@@ -23,6 +23,15 @@ class Settings(BaseSettings):
 
     # ── HTTP client / anti-bot tuning (used by services.shopee_client) ──
     proxy_url: str = ""
+    # Path to a proxy list file (one proxy per line: http://ip:port or
+    # socks5://ip:port). Used for Shopee search requests with rotation.
+    # When empty, PROXY_URL (single proxy) is used; when both empty → direct.
+    proxy_file: str = ""
+    # Max proxies to try for one search before giving up (only when a pool
+    # is loaded). A failing proxy is skipped and parked on cooldown.
+    proxy_max_tries: int = 4
+    # Seconds a failing proxy is parked before it may be retried.
+    proxy_cooldown: float = 300.0
     request_timeout: float = 30.0
     max_retries: int = 3
     retry_backoff_base: float = 2.0
